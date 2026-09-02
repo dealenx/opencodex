@@ -45,7 +45,8 @@ FROM oven/bun:1.4.0-slim AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production \
-    OPENCODEX_HOME=/data
+    OPENCODEX_HOME=/data \
+    PORT=10100
 
 # Runtime deps, built GUI, and runnable source from the build stage.
 COPY --from=build /app/node_modules ./node_modules
