@@ -18,21 +18,8 @@ cmds = ["bun run build:gui"]
 PORT = "10100"
 
 [start]
-# Boot obligations inside a container:
-#
-# 1. Bind host. The proxy binds 127.0.0.1 unless config.json carries
-#    "hostname": "0.0.0.0" — a loopback bind is unreachable through the platform's
-#    edge proxy (persistent 502 behind a healthy banner). The Dokploy file mount
-#    delivers the operator's config at /root/.opencodex/config.json (the proxy's
-#    default home); with the hostname key set there, the wildcard bind applies.
-#    scripts/seed-container-config.ts is a belt-and-braces fallback for deployments
-#    without a mount: it adds the key once, idempotently, and never overwrites an
-#    operator's explicit choice. (start has no --hostname flag; the config field is
-#    the only bind control.)
-# 2. Provenance. The GUI build provenance lands next to the config so
-#    /build-info.json keeps reporting the running image.
-#
-# The seed is a separate script, not inline sed: a multiline shell command in this
-# table is embedded verbatim into a generated Dockerfile CMD, and an embedded
-# newline breaks the Dockerfile parse ("unknown instruction").
-cmd = "bun run scripts/seed-container-config.ts && sh -c 'cp -n /app/gui/dist/build-info.json /root/.opencodex/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start --port $PORT'"
+# start:container wraps the container-only boot steps: the idempotent
+# hostname seed (scripts/seed-container-config.ts), the GUI provenance copy
+# into the config home, and the proxy itself on $PORT (default 10100).
+# Plain `bun run start` stays the desktop path — it touches nothing.
+cmd = "bun run start:container"

@@ -37,7 +37,7 @@
     "dev": "bun run src/cli/index.ts start",
     "dev:proxy": "bun run src/cli/index.ts start",
     "dev:gui": "cd gui && bun run dev",
-    "start": "bun run src/cli/index.ts start",
+    "start": "bun run scripts/seed-container-config.ts && sh -c 'mkdir -p ${OPENCODEX_HOME:-$HOME/.opencodex} && cp -n gui/dist/build-info.json ${OPENCODEX_HOME:-$HOME/.opencodex}/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start --port ${PORT:-10100}'",
     "test": "bun scripts/test.ts",
     "test:changed": "bun scripts/test.ts --changed=dev",
     "typecheck": "bun x tsc --noEmit",
