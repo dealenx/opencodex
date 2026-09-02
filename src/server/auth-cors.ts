@@ -765,6 +765,10 @@ export function safeConfigDTO(config: OcxConfig): unknown {
       "preserveReasoningContentModels",
       "requiresReasoningPlaceholderModels",
       "escapeBuiltinToolNames",
+      // The operator's own note (dashboard Notes editor / hand edit). Read back only
+      // when no registry note replaces it below; the registry row still wins so a
+      // vendor usage restriction is never hidden by a user label.
+      "note",
     ] as const) {
       copyIfDefined(dto, provider, key);
     }
