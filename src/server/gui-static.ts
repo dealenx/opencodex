@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { browserSecurityHeaders } from "./auth-cors";
+import { readBuildInfo } from "./build-info";
 import type { GuiSessionBootstrap } from "./management-auth";
 
 /** opencodex version, read from the packaged package.json (same source as the server bootstrap). */
@@ -136,10 +137,12 @@ export function serveGuiFile(
 }
 
 export function rootFallbackPayload() {
+  const buildInfo = readBuildInfo();
   return {
     status: "ok",
     service: "opencodex",
     version: VERSION,
+    buildInfo,
     dashboard: {
       available: false,
       reason: "GUI build not found. Run `bun run build:gui` from the opencodex repo, or use `ocx gui` from a packaged install.",
@@ -150,6 +153,7 @@ export function rootFallbackPayload() {
       responses: "/v1/responses",
       chatCompletions: "/v1/chat/completions",
       management: "/api/*",
+      buildInfo: "/build-info.json",
     },
   };
 }

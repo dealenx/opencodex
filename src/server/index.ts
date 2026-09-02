@@ -77,6 +77,7 @@ export {
 import { formatCodexProviderForLog } from "../codex/routing";
 import { CatalogGatherBusyError } from "../codex/catalog/provider-fetch";
 import { registerCodexWebSocket, tryReserveCodexWebSocket, unregisterCodexWebSocket, updateCodexWebSocketAuthContext } from "../codex/websocket-registry";
+import { readBuildInfo } from "./build-info";
 import { resolveGuiFilePath, rootFallbackPayload, serveGuiFile, serveSessionBootstrap } from "./gui-static";
 export { resolveGuiFilePath, rootFallbackPayload } from "./gui-static";
 export { resolveAdapter } from "./adapter-resolve";
@@ -1736,6 +1737,15 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       // Vite dev server can mint an origin-bound loopback session on a fresh checkout.
       if (url.pathname === "/opencodex-session" && guiSessionCandidate) {
         return serveSessionBootstrap(guiSessionCandidate);
+      }
+      // Build provenance answers even without a packaged GUI build: the file is written
+      // into $OPENCODEX_HOME by image builds, and /build-info.json must report it in
+      // both the dashboard and dashboard-less deployments.
+      if (url.pathname === "/build-info.json" && req.method === "GET") {
+        const buildInfo = readBuildInfo();
+        if (buildInfo) {
+          return withCors(jsonResponse(buildInfo), req, policy);
+        }
       }
       const guiFile = serveGuiFile(url.pathname, undefined, guiSessionCandidate ?? undefined);
       if (guiFile) return guiFile;

@@ -64,4 +64,6 @@ VOLUME ["/data"]
 EXPOSE 10100
 
 # Foreground process with graceful SIGTERM drain (handlers live in src/cli/index.ts).
-CMD ["bun", "run", "src/cli/index.ts", "start"]
+# Seed the volume with the image's build provenance so GET /build-info.json reports the
+# running image even after volume restorage. The proxy prefers $OPENCODEX_HOME's copy.
+CMD ["sh", "-c", "cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start"]
