@@ -13,3 +13,4 @@ docs-site
 Dockerfile
 docker-compose.yml
 railway.json
+src/generated/compatibility-version.json
