@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { markActivity } from "../lib/sidecar-tracker";
 import { knownModelIdsForProvider } from "../router";
 import {
@@ -551,6 +552,17 @@ export function warnAgentTaskRecoveryStartup(config: {
   console.warn("⚠️  Experimental encrypted V2 task recovery is enabled.");
   console.warn("   A scoped cache miss may send an additional authenticated request to ChatGPT and may consume quota or add latency; concurrent misses can share one request.");
   console.warn("   Recovered plaintext assignment data is retained only in a bounded, process-local in-memory cache; exact fidelity is not guaranteed and the path depends on undocumented backend behavior.");
+}
+
+/**
+ * A loopback bind inside a container is almost always a misconfiguration: no
+ * external client (the platform's edge proxy included) can reach loopback, and the
+ * only symptom is a 502 behind a healthy startup banner. Container detection uses
+ * the same /.dockerenv marker service.ts already keys "unsupported in Docker" on.
+ * Extracted so the deploy-critical branch is testable on non-container hosts.
+ */
+export function isLoopbackBindInsideContainer(bindHost: string, dockerEnvPath = "/.dockerenv"): boolean {
+  return (bindHost === "127.0.0.1" || bindHost === "::1") && existsSync(dockerEnvPath);
 }
 
 export function startServer(port?: number, deps: StartServerDeps = {}): Server<WsData> {
@@ -2027,17 +2039,35 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       );
     },
   });
+
   setServerRef(server);
   const actualPort = server.port ?? listenPort;
   boundPort = actualPort;
   setCorsOrigin(actualPort);
 
-  console.log(`🚀 opencodex proxy running on http://localhost:${actualPort}`);
+  // The bind host, not a hardcoded "localhost": a container binding 0.0.0.0 and a
+  // desktop binding loopback both previously printed the same line, and the one
+  // operator-visible symptom of a wrong bind (edge 502 behind a healthy banner) had
+  // no log signal at all. Wildcard binds display the wildcard; loopback stays
+  // "localhost" because that is what it means.
+  const bannerHost = bindHost === "0.0.0.0" || bindHost === "::"
+    ? "0.0.0.0"
+    : bindHost;
+  console.log(`🚀 opencodex proxy running on http://${bannerHost}:${actualPort} (bound to ${bindHost})`);
   console.log(`   POST /v1/responses → provider translation`);
   console.log(`   POST /v1/chat/completions → OpenAI-compatible clients`);
   console.log(`   GET  /healthz      → health check`);
   console.log(`   GET  /api/*        → management API`);
   console.log(`   GET  /             → GUI dashboard`);
+  // The failure mode this exact deploy hit: the process is alive, the edge proxy
+  // answers 502, and nothing in the log says why. Container detection is the same
+  // marker service.ts already uses; a loopback bind inside one is almost always a
+  // misconfiguration because no external client can reach loopback.
+  if (isLoopbackBindInsideContainer(bindHost)) {
+    console.warn(`⚠️  Bound to 127.0.0.1 inside a container. Nothing outside the container`);
+    console.warn(`   can reach this proxy — a platform edge proxy will answer 502.`);
+    console.warn(`   Fix: set "hostname": "0.0.0.0" in $OPENCODEX_HOME/config.json (config.json).`);
+  }
 
   if (loopbackServer) {
     // Loud on every start, not once at enable time. An operator who inherits a config, or
