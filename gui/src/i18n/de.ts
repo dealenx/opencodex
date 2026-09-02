@@ -2321,4 +2321,5 @@ export const de: Record<TKey, string> = {
   "models.aliasAuto": "automatisch",
   "models.aliasUser": "benutzerdefiniert",
   "models.aliasStale": "veraltet",
+  "quota.planLevel": "Plan level",
 };

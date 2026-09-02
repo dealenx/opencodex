@@ -720,7 +720,27 @@ async function fetchOllamaQuota(provider: string, config: OcxProviderConfig): Pr
       }
     }
   }
-  return windows > 0 ? report(provider, "ollama:api-usage", quota) : null;
+  // Plan level comes from POST /api/me (the dashboard's own identity probe; GET is
+  // 405 by design). It is identity metadata, not a quota window: fail-soft, and a
+  // failure keeps the usage bars while omitting the plan row.
+  const me = await fetch(`${OLLAMA_CLOUD_BASE_URL}/api/me`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: "{}",
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }).catch(() => undefined);
+  const meBody = me?.ok ? asRecord(await readQuotaJson(me)) : undefined;
+  const plan = typeof meBody?.Plan === "string" && meBody.Plan.trim() ? meBody.Plan.trim().toLowerCase() : undefined;
+  if (plan) quota.customWindows = [...(quota.customWindows ?? []), {
+    label: `Plan: ${plan}`,
+    percent: 0,
+  }];
+  return windows > 0 || plan ? report(provider, "ollama:api-usage", quota) : null;
 }
 
 /**

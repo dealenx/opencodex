@@ -125,7 +125,12 @@ export function RailRow({ item, selected, tabbable, modelCount, isDefault, showC
   const countLabel = modelCount !== undefined && modelCount > 0
     ? (modelCount === 1 ? t("pws.modelCountOne") : t("pws.modelCount", { count: modelCount }))
     : "";
-  const secondaryLabel = [showConfigId ? item.name : "", countLabel].filter(Boolean).join(" · ");
+  // The operator's note (typically the account email on per-account provider rows)
+  // joins the model count in the secondary line, so multi-account destinations are
+  // distinguishable at a glance. The note is identity text the operator chose, so it
+  // renders as-is rather than being parsed for an email shape.
+  const noteLabel = item.note?.trim() ?? "";
+  const secondaryLabel = [noteLabel, showConfigId ? item.name : "", countLabel].filter(Boolean).join(" · ");
   return (
     <button
       type="button"

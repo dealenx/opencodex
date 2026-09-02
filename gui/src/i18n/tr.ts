@@ -2344,4 +2344,5 @@ export const tr: Record<TKey, string> = {
   "models.aliasAuto": "otomatik",
   "models.aliasUser": "kullanıcı",
   "models.aliasStale": "eski",
+  "quota.planLevel": "Plan level",
 };

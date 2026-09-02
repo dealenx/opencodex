@@ -2343,4 +2343,5 @@ export const ko: Record<TKey, string> = {
   "models.aliasAuto": "자동",
   "models.aliasUser": "사용자",
   "models.aliasStale": "오래됨",
+  "quota.planLevel": "Plan level",
 };

@@ -2344,4 +2344,5 @@ export const ru: Record<TKey, string> = {
   "models.aliasAuto": "авто",
   "models.aliasUser": "пользователь",
   "models.aliasStale": "устарел",
+  "quota.planLevel": "Уровень плана",
 };

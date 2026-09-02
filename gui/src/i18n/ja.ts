@@ -2342,4 +2342,5 @@ export const ja: Record<TKey, string> = {
   "models.aliasAuto": "自動",
   "models.aliasUser": "ユーザー",
   "models.aliasStale": "古い",
+  "quota.planLevel": "Plan level",
 };

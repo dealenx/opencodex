@@ -12,6 +12,7 @@ import {
   type ProviderQuotaReportView,
 } from "../../provider-workspace/report";
 import { type QuotaWindowKey } from "../QuotaBars";
+import type { AccountQuota } from "../../codex-quota-utils";
 import QuotaBars from "../QuotaBars";
 
 function bcp47(locale: Locale): string {
@@ -81,13 +82,21 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
     return date === null ? null : new Intl.DateTimeFormat(localeTag, { dateStyle: "medium" }).format(date);
   };
   const periodEnd = credits?.expiresAt === undefined ? null : formatPeriodEnd(credits.expiresAt);
+  // Identity windows published by per-provider probes (Ollama "Plan: max") are not
+  // bars: they carry percent 0 and exist so the plan level survives aggregation.
+  // Pull the newest one out for the details row instead of drawing it as a bar.
+  const identityWindows = (primaryQuota?.customWindows ?? []).filter(w => /^Plan: /.test(w.label) && w.percent === 0);
+  const planWindow = identityWindows[identityWindows.length - 1];
+  const planRow = planWindow ? { plan: planWindow.label.slice("Plan: ".length) } : null;
+  const barQuota: AccountQuota | null = planWindow && primaryQuota
+    ? { ...primaryQuota, customWindows: primaryQuota.customWindows?.filter(w => w !== planWindow) }
+    : primaryQuota;
 
   return (
     <>
-      {showsAggregate && <div className="pws-capacity-label">{t("pws.capacity.estimate")}</div>}
-      {(primaryQuota || pending) && (
+      {(barQuota || pending) && (
         <QuotaBars
-          quota={primaryQuota}
+          quota={barQuota}
           threshold={80}
           t={t}
           layout="stacked"
@@ -96,8 +105,14 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
           incompleteCustomWindowLabels={showsAggregate ? incompleteCustomWindowLabels : undefined}
         />
       )}
-      {(credits || aggregation) && (
+      {(credits || aggregation || planRow) && (
         <div className="pws-capacity-details">
+          {planRow && (
+            <div className="pws-capacity-recovery">
+              <span>{t("quota.planLevel")}</span>
+              <strong>{planRow.plan}</strong>
+            </div>
+          )}
           {credits && (
             <div className="pws-capacity-recovery">
               <span>{t("quota.creditsBalance")}</span>

@@ -2306,4 +2306,5 @@ export const zhTW: Record<TKey, string> = {
   "models.aliasAuto": "自動",
   "models.aliasUser": "使用者",
   "models.aliasStale": "過期",
+  "quota.planLevel": "Plan level",
 };

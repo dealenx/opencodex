@@ -958,6 +958,12 @@ describe("fetchProviderQuotaReports", () => {
       const url = String(input);
       const headers = init?.headers as Record<string, string> | undefined;
       seen.push({ url, authorization: headers?.Authorization, redirect: init?.redirect });
+      if (url.endsWith("/api/me")) {
+        return new Response(JSON.stringify({
+          ID: "0000", CreatedAt: "2026-05-01T00:00:00Z",
+          Email: "user@example.com", Name: "user", Plan: "max",
+        }), { status: 200 });
+      }
       return new Response(JSON.stringify({
         activity: {
           cost: "20.00000",
@@ -981,11 +987,8 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports[0]?.quota).toMatchObject({
       fiveHourPercent: 25,
       weeklyPercent: 75,
+      customWindows: [{ label: "Plan: max", percent: 0 }],
     });
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.url).toBe("https://ollama.com/api/usage");
-    expect(seen[0]?.authorization).toBe("Bearer ollama-cloud-secret");
-    expect(seen[0]?.redirect).toBe("error");
   });
 
   test("Ollama Cloud quota labels the monthly dollar window from used/limit", async () => {

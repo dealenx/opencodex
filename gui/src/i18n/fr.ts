@@ -2308,4 +2308,5 @@ export const fr: Record<TKey, string> = {
   "models.aliasAuto": "auto",
   "models.aliasUser": "utilisateur",
   "models.aliasStale": "obsolète",
+  "quota.planLevel": "Plan level",
 };

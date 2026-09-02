@@ -2342,4 +2342,5 @@ export const zh: Record<TKey, string> = {
   "models.aliasAuto": "自动",
   "models.aliasUser": "用户",
   "models.aliasStale": "过期",
+  "quota.planLevel": "Plan level",
 };
