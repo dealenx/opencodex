@@ -12,5 +12,10 @@ cacheDirectories = ["/root/.bun/install/cache"]
 [phases.build]
 cmds = ["bun run build:gui"]
 
+[variables]
+# Dokploy Nixpacks deploys do not inject PORT; without a default the empty expansion
+# collapses '--port $PORT' to a dangling flag and the CLI exits with a usage error.
+PORT = "10100"
+
 [start]
 cmd = "bun run src/cli/index.ts start --port $PORT"
