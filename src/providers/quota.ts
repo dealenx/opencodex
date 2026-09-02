@@ -82,6 +82,8 @@ const OPENCODE_GO_USAGE_URL = `${OPENCODE_GO_BASE_URL}/usage`;
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 const CLINE_BASE_URL = "https://api.cline.bot";
+const OLLAMA_CLOUD_BASE_URL = "https://ollama.com";
+const OLLAMA_CLOUD_USAGE_URL = `${OLLAMA_CLOUD_BASE_URL}/api/usage`;
 const ZAI_BASE_URL = "https://api.z.ai";
 const ZAI_CN_BASE_URL = "https://open.bigmodel.cn";
 const MINIMAX_REMAINS_URL = "https://www.minimax.io/v1/token_plan/remains";
@@ -313,6 +315,13 @@ function isCanonicalDeepSeekBaseUrl(baseUrl: string): boolean {
 function isCanonicalClineBaseUrl(baseUrl: string): boolean {
   const normalized = normalizedBaseUrl(baseUrl);
   return normalized === CLINE_BASE_URL || normalized === `${CLINE_BASE_URL}/api/v1`;
+}
+
+function isCanonicalOllamaCloudBaseUrl(baseUrl: string): boolean {
+  // The dashboard row points at https://ollama.com/v1 (the OpenAI-compat spelling); the
+  // usage API lives on the bare origin, so the canonical set is the origin and the /v1 row.
+  const normalized = normalizedBaseUrl(baseUrl);
+  return normalized === OLLAMA_CLOUD_BASE_URL || normalized === `${OLLAMA_CLOUD_BASE_URL}/v1`;
 }
 
 function isCanonicalZaiBaseUrl(baseUrl: string): boolean {
@@ -644,6 +653,74 @@ async function fetchClineQuota(provider: string, config: OcxProviderConfig): Pro
     }
   }
   return windows > 0 ? report(provider, "cline:plan-usage-limits", quota) : null;
+}
+
+/**
+ * Ollama Cloud `GET /api/usage` — the official usage endpoint behind the
+ * dashboard's settings page, documented at docs.ollama.com/cloud and served
+ * to any personal API key as `Authorization: Bearer`. The payload carries an
+ * `activity` block (4-week spend + per-model request/cost rows) and a
+ * `limits` block whose key set varies by plan: Max plans report fractional
+ * `session`/`weekly` windows, Max-included plans report a `monthly` window
+ * carrying used/limit dollars. Every `limits.*.usage` row observed so far is
+ * a CONSUMED FRACTION in 0..1 (not percent), so it maps straight onto the
+ * ProviderQuota percent fields; `monthly` additionally carries `used`/`limit`
+ * dollar amounts, which surface as a labeled custom window.
+ *
+ * There is no reset timestamp in the payload (the settings page renders its
+ * own clock), so windows are published without resetAt — the dashboard shows
+ * the bar without a countdown, matching what the upstream actually knows.
+ */
+async function fetchOllamaQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+  // Never send the API key to a lookalike host: this credential also authorizes inference.
+  if (!isCanonicalOllamaCloudBaseUrl(config.baseUrl)) return null;
+  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  if (!apiKey) return null;
+  const response = await fetch(OLLAMA_CLOUD_USAGE_URL, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+      ? TERMINAL_QUOTA_FAILURE
+      : null;
+  }
+  const body = asRecord(await readQuotaJson(response));
+  const limits = asRecord(body?.limits);
+  if (!limits) return null;
+  const quota: ProviderQuota = { updatedAt: Date.now() };
+  let windows = 0;
+  const session = asRecord(limits.session);
+  const sessionPercent = normalizePercent(toFiniteNumber(session?.usage));
+  if (sessionPercent !== undefined) {
+    // Fractional shares arrive in 0..1; a percent-scale payload would clamp to 100.
+    quota.fiveHourPercent = sessionPercent <= 1 ? sessionPercent * 100 : sessionPercent;
+    windows += 1;
+  }
+  const weekly = asRecord(limits.weekly);
+  const weeklyPercent = normalizePercent(toFiniteNumber(weekly?.usage));
+  if (weeklyPercent !== undefined) {
+    quota.weeklyPercent = weeklyPercent <= 1 ? weeklyPercent * 100 : weeklyPercent;
+    windows += 1;
+  }
+  const monthly = asRecord(limits.monthly);
+  if (monthly) {
+    const monthlyPercent = normalizePercent(toFiniteNumber(monthly.usage));
+    if (monthlyPercent !== undefined) {
+      quota.monthlyPercent = monthlyPercent <= 1 ? monthlyPercent * 100 : monthlyPercent;
+      windows += 1;
+      const used = toFiniteNumber(monthly.used);
+      const limit = toFiniteNumber(monthly.limit);
+      if (used !== undefined && limit !== undefined && limit > 0) {
+        quota.customWindows = [...(quota.customWindows ?? []), {
+          label: `Included usage ($${used.toFixed(2)} of $${limit.toFixed(2)} used)`,
+          percent: quota.monthlyPercent,
+        }];
+      }
+    }
+  }
+  return windows > 0 ? report(provider, "ollama:api-usage", quota) : null;
 }
 
 /**
@@ -2308,6 +2385,12 @@ async function maybeFetchProviderQuota(
     }
     if ((provider.authMode ?? "key") === "key" && name === "neuralwatt") {
       return fetchNeuralwattQuota(name, provider);
+    }
+    // Ollama Cloud rows are identified by DESTINATION, not by name: multi-account
+    // setups keep the same endpoint under names like `ollama-mimikkai`, and the
+    // canonical check inside the fetcher refuses to send the key to lookalike hosts.
+    if ((provider.authMode ?? "key") === "key" && isCanonicalOllamaCloudBaseUrl(provider.baseUrl)) {
+      return fetchOllamaQuota(name, provider);
     }
     return null;
   } catch {

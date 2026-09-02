@@ -952,6 +952,117 @@ describe("fetchProviderQuotaReports", () => {
     expect(seen).toEqual([]);
   });
 
+  test("Ollama Cloud quota maps session/weekly/monthly windows from /api/usage", async () => {
+    const seen: Array<{ url: string; authorization?: string; redirect?: RequestRedirect }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const headers = init?.headers as Record<string, string> | undefined;
+      seen.push({ url, authorization: headers?.Authorization, redirect: init?.redirect });
+      return new Response(JSON.stringify({
+        activity: {
+          cost: "20.00000",
+          period: { type: "last_4_weeks", starting_at: "2026-08-10T00:00:00Z" },
+          models: [{ name: "glm-5.3-flash", request_count: 87, cost: "13.09495" }],
+        },
+        limits: {
+          session: { usage: 0.25, models: [{ name: "glm-5.3-flash", request_count: 2 }] },
+          weekly: { usage: 0.75, models: [{ name: "glm-5.3-flash", request_count: 87 }] },
+        },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.source).toBe("ollama:api-usage");
+    expect(result.reports[0]?.quota).toMatchObject({
+      fiveHourPercent: 25,
+      weeklyPercent: 75,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe("https://ollama.com/api/usage");
+    expect(seen[0]?.authorization).toBe("Bearer ollama-cloud-secret");
+    expect(seen[0]?.redirect).toBe("error");
+  });
+
+  test("Ollama Cloud quota labels the monthly dollar window from used/limit", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      activity: { cost: "0.00000", models: [] },
+      limits: {
+        monthly: {
+          usage: 0.1,
+          used: 30,
+          limit: 300,
+          models: [],
+        },
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.quota.monthlyPercent).toBe(10);
+    expect(result.reports[0]?.quota.customWindows).toEqual([{
+      label: "Included usage ($30.00 of $300.00 used)",
+      percent: 10,
+    }]);
+  });
+
+  test("Ollama Cloud quota treats a terminal 401 as invalid (drops last-good)", async () => {
+    let rejected = false;
+    globalThis.fetch = (async () => {
+      if (rejected) return new Response("unauthorized", { status: 401 });
+      return new Response(JSON.stringify({
+        activity: { cost: "0.00000", models: [] },
+        limits: { session: { usage: 0, models: [] } },
+      }), { status: 200 });
+    }) as typeof fetch;
+    const config = keyQuotaConfig("ollama-cloud", "https://ollama.com/v1");
+
+    const valid = await fetchProviderQuotaReports(config, true);
+    rejected = true;
+    const invalid = await fetchProviderQuotaReports(config, true);
+
+    expect(valid.reports).toHaveLength(1);
+    expect(invalid.reports).toEqual([]);
+  });
+
+  test("Ollama Cloud quota never sends the key to a non-canonical base URL", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://attacker.example/v1"),
+      true,
+    );
+
+    expect(result.reports).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  test("Ollama Cloud quota reports nothing when the limits block carries no windows", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      activity: { cost: "1.00000", models: [{ name: "glm-5.3-flash", request_count: 5 }] },
+      limits: {},
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toEqual([]);
+  });
+
   test("Z.AI quota sends the key as a Bearer token and maps plan windows", async () => {
     const seen: Array<{ url: string; authorization?: string; redirect?: RequestRedirect }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
