@@ -38,6 +38,17 @@ export function normalizePackageModes(packageRoot: string): void {
 // assembly. The output stays untracked to avoid a self-referential digest, but
 // package.json already ships src/** so the generated artifact is embedded.
 if (import.meta.main) {
-  generateCompatibilityVersionManifest(root);
+  // The manifest hashes git-tracked bytes via `git ls-files`. A Docker/Nixpacks build
+  // context has no .git, and the shipped proxy does not read the generated manifest for
+  // routing decisions it cannot already make — skip generation there instead of failing
+  // the whole build. Packaged installs (npm pack / release pipeline) always have .git.
+  try {
+    generateCompatibilityVersionManifest(root);
+  } catch (error) {
+    console.warn(
+      "[prepare-package] skipping compatibility manifest:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   normalizePackageModes(root);
 }
