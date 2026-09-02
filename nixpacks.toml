@@ -16,23 +16,23 @@ cmds = ["bun run build:gui"]
 # Dokploy Nixpacks deploys do not inject PORT; without a default the empty expansion
 # collapses '--port $PORT' to a dangling flag and the CLI exits with a usage error.
 PORT = "10100"
-# Mirror the Dockerfile runtime: a persistent volume holds the config so provider
-# rows, api keys, and usage history survive redeploys.
-OPENCODEX_HOME = "/data"
 
 [start]
-# Two boot obligations the upstream defaults get wrong inside a container:
+# Boot obligations inside a container:
 #
 # 1. Bind host. The proxy binds 127.0.0.1 unless config.json carries
 #    "hostname": "0.0.0.0" — a loopback bind is unreachable through the platform's
-#    edge proxy, which is exactly the persistent 502 after a healthy container
-#    start. scripts/seed-container-config.ts adds the key once, idempotently, and
-#    never overwrites an operator's explicit choice. (start has no --hostname flag;
-#    the config field is the only bind control.)
-# 2. Volume seed. The GUI build provenance is copied into the volume the same way
-#    the Dockerfile CMD does, so /build-info.json keeps reporting the running image.
+#    edge proxy (persistent 502 behind a healthy banner). The Dokploy file mount
+#    delivers the operator's config at /root/.opencodex/config.json (the proxy's
+#    default home); with the hostname key set there, the wildcard bind applies.
+#    scripts/seed-container-config.ts is a belt-and-braces fallback for deployments
+#    without a mount: it adds the key once, idempotently, and never overwrites an
+#    operator's explicit choice. (start has no --hostname flag; the config field is
+#    the only bind control.)
+# 2. Provenance. The GUI build provenance lands next to the config so
+#    /build-info.json keeps reporting the running image.
 #
 # The seed is a separate script, not inline sed: a multiline shell command in this
 # table is embedded verbatim into a generated Dockerfile CMD, and an embedded
 # newline breaks the Dockerfile parse ("unknown instruction").
-cmd = "bun run scripts/seed-container-config.ts && sh -c 'cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start --port $PORT'"
+cmd = "bun run scripts/seed-container-config.ts && sh -c 'cp -n /app/gui/dist/build-info.json /root/.opencodex/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start --port $PORT'"
