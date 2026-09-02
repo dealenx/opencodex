@@ -24,17 +24,15 @@ OPENCODEX_HOME = "/data"
 # Two boot obligations the upstream defaults get wrong inside a container:
 #
 # 1. Bind host. The proxy binds 127.0.0.1 unless config.json carries
-#    "hostname": "0.0.0.0" (src/server/index.ts canonicalizes an absent hostname to
-#    loopback). A loopback bind is unreachable through the platform's edge proxy,
-#    which is exactly the persistent 502 after a healthy container start. The seed
-#    below patches the volume config once, idempotently: it only ADDS the key when
-#    the parsed config has none, never overwriting an operator's explicit choice.
-#    (start has no --hostname flag; the config field is the only bind control.)
-#
+#    "hostname": "0.0.0.0" — a loopback bind is unreachable through the platform's
+#    edge proxy, which is exactly the persistent 502 after a healthy container
+#    start. scripts/seed-container-config.ts adds the key once, idempotently, and
+#    never overwrites an operator's explicit choice. (start has no --hostname flag;
+#    the config field is the only bind control.)
 # 2. Volume seed. The GUI build provenance is copied into the volume the same way
 #    the Dockerfile CMD does, so /build-info.json keeps reporting the running image.
-cmd = """sh -c 'mkdir -p /data && cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; \
-if [ -f /data/config.json ] && ! grep -q "\\"hostname\\"" /data/config.json; then \
-  sed -i "s|{|{\n  \\"hostname\\": \\"0.0.0.0\\",|" /data/config.json; \
-fi; \
-exec bun run src/cli/index.ts start --port $PORT'"""
+#
+# The seed is a separate script, not inline sed: a multiline shell command in this
+# table is embedded verbatim into a generated Dockerfile CMD, and an embedded
+# newline breaks the Dockerfile parse ("unknown instruction").
+cmd = "bun run scripts/seed-container-config.ts && sh -c 'cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start --port $PORT'"
