@@ -1,0 +1,16 @@
+# Nixpacks build plan for the opencodex proxy: Bun runtime, GUI dashboard built in-image.
+# Read automatically when the Dokploy/Railway builder is Nixpacks; ignored by the
+# DOCKERFILE builder (the equivalent steps live in the Dockerfile).
+
+[phases.setup]
+nixPkgs = ["bun"]
+
+[phases.install]
+cmds = ["bun install --frozen-lockfile"]
+cacheDirectories = ["/root/.bun/install/cache"]
+
+[phases.build]
+cmds = ["bun run build:gui"]
+
+[start]
+cmd = "bun run src/cli/index.ts start --port $PORT"
