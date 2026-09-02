@@ -2284,7 +2284,7 @@ async function maybeFetchProviderQuota(
     if ((provider.authMode ?? "key") === "key" && name === "deepseek") {
       return fetchDeepSeekQuota(name, provider);
     }
-    if ((provider.authMode ?? "key") === "key" && name === "cline-pass") {
+    if ((provider.authMode ?? "key") === "key" && registryEntryForProviderDestination(provider)?.id === "cline-pass") {
       return fetchClineQuota(name, provider);
     }
     if ((provider.authMode ?? "key") === "key"

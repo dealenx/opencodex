@@ -1,0 +1,15 @@
+node_modules
+**/node_modules
+gui/node_modules
+gui/dist
+.git
+.devlog
+devlog
+.tmp
+tests
+docs-site
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+railway.json

@@ -1,0 +1,17 @@
+services:
+  opencodex:
+    build: .
+    container_name: opencodex
+    restart: unless-stopped
+    ports:
+      - "10100:10100"
+    environment:
+      # Required for the dashboard-generated keys (x-opencodex-api-key) to be honored
+      # on a non-loopback bind. Generate a strong value and keep it secret.
+      OPENCODEX_API_AUTH_TOKEN: ${OPENCODEX_API_AUTH_TOKEN:?set a strong token}
+      # All mutable state (config.json, usage.jsonl, admin-api-token) lives here.
+      OPENCODEX_HOME: /data
+    volumes:
+      - opencodex-data:/data
+volumes:
+  opencodex-data:
