@@ -16,6 +16,25 @@ cmds = ["bun run build:gui"]
 # Dokploy Nixpacks deploys do not inject PORT; without a default the empty expansion
 # collapses '--port $PORT' to a dangling flag and the CLI exits with a usage error.
 PORT = "10100"
+# Mirror the Dockerfile runtime: a persistent volume holds the config so provider
+# rows, api keys, and usage history survive redeploys.
+OPENCODEX_HOME = "/data"
 
 [start]
-cmd = "bun run src/cli/index.ts start --port $PORT"
+# Two boot obligations the upstream defaults get wrong inside a container:
+#
+# 1. Bind host. The proxy binds 127.0.0.1 unless config.json carries
+#    "hostname": "0.0.0.0" (src/server/index.ts canonicalizes an absent hostname to
+#    loopback). A loopback bind is unreachable through the platform's edge proxy,
+#    which is exactly the persistent 502 after a healthy container start. The seed
+#    below patches the volume config once, idempotently: it only ADDS the key when
+#    the parsed config has none, never overwriting an operator's explicit choice.
+#    (start has no --hostname flag; the config field is the only bind control.)
+#
+# 2. Volume seed. The GUI build provenance is copied into the volume the same way
+#    the Dockerfile CMD does, so /build-info.json keeps reporting the running image.
+cmd = """sh -c 'mkdir -p /data && cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; \
+if [ -f /data/config.json ] && ! grep -q "\\"hostname\\"" /data/config.json; then \
+  sed -i "s|{|{\n  \\"hostname\\": \\"0.0.0.0\\",|" /data/config.json; \
+fi; \
+exec bun run src/cli/index.ts start --port $PORT'"""
