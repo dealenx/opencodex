@@ -22,4 +22,4 @@ PORT = "10100"
 # hostname seed (scripts/seed-container-config.ts), the GUI provenance copy
 # into the config home, and the proxy itself on $PORT (default 10100).
 # Plain `bun run start` stays the desktop path — it touches nothing.
-cmd = "bun run start:container"
+cmd = "bun run start"
