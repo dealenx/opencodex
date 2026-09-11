@@ -15,6 +15,7 @@ scripts/**
 !scripts/generate-build-info.ts
 !scripts/prepare-package.ts
 !scripts/generate-compatibility-version.ts
+!scripts/seed-container-config.ts
 
 !docker/
 !docker/**
