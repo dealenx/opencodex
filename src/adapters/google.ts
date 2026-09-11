@@ -30,7 +30,7 @@ import {
   clearAntigravityReplay,
   observeAntigravityReplay,
 } from "./google-antigravity-replay";
-import { resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
+import { canonicalAntigravityUsageModel, resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
 import { googleVertexLocationConfigError } from "../providers/google-vertex-location";
 import { forgetThoughtSignatureForReplay, lookupReplayThoughtSignature } from "../responses/thought-signature-replay";
 import {
@@ -52,10 +52,48 @@ const GOOGLE_BREVITY_INSTRUCTION = [
   "- Do detailed reasoning internally, not as visible intermediate output.",
   "- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.",
   "- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires.",
+  "- Formatting: The client environment renders standard Markdown and does not support LaTeX math delimiters ($...$, $$...$$, \\(...\\), \\[...\\]). Do not use LaTeX math delimiters or LaTeX markup (such as \\text{}, \\times, \\le, \\ge, etc.) for variables, formulas, dimensions, or units. Use clean plain text, Markdown, and Unicode symbols (e.g. 180°, 2560 × 1920 px, ≤, ≥, Δ, ±) instead.",
 ].join("\n");
 
 const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+/**
+ * CCA Flash generations that reject the Claude-Agent identity paragraph.
+ *
+ * Membership is probe-established per generation, never assumed: 3.7 and 3.8 both answer
+ * 429 RESOURCE_EXHAUSTED when this paragraph survives into `systemInstruction`, and 200 with
+ * it stripped — same account, seconds apart. A policy rejection wearing a quota error's
+ * clothing sends users hunting a quota problem that does not exist, so a new generation is
+ * added here only after the probe, and never dropped on the assumption that Google fixed it.
+ */
+const ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS = new Set([
+  "gemini-3.7-flash",
+  "gemini-3.8-flash",
+]);
+
+/**
+ * Whether CCA rejects the Claude-Agent identity paragraph for this request.
+ *
+ * Judged on the ROUTED WIRE id, not the selector, because three different selectors reach the
+ * same rejecting generation:
+ *
+ * - the collapsed base (`gemini-3.8-flash`);
+ * - a raw suffix id (`gemini-3.8-flash-high`), which the picker publishes whenever discovery
+ *   returns a PARTIAL ladder;
+ * - a RETIRED id (`gemini-3.6-flash`), which rule 0 redirects onto `gemini-3.7-flash-tiered`.
+ *
+ * That last one is why a selector-keyed test is not enough: retired ids deliberately keep their
+ * own identity for usage accounting, so they never canonicalize into the generation they
+ * actually call. A saved 3.6 selection was probed at 429 with the paragraph intact for exactly
+ * this reason. Matching on the wire id also means a future generation is covered by naming its
+ * wire spelling once, rather than every selector that can reach it.
+ */
+function rejectsClaudeSdkParagraph(modelId: string, wireModelId: string): boolean {
+  const canonicalWire = canonicalAntigravityUsageModel(wireModelId.replace(/-tiered$/, ""));
+  return ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalWire)
+    || ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalAntigravityUsageModel(modelId));
+}
 
 function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string {
   return systemText
@@ -389,6 +427,18 @@ function messagesToGeminiFormat(
         break;
       }
     }
+  }
+
+  // Gemini API and Claude-on-Antigravity reject assistant-tail (model-tail in Gemini terms)
+  // histories. Gemini fails upstream with "Requests ending with a model turn are not supported"
+  // (HTTP 400), while Claude fails with "This model does not support assistant message prefill.
+  // The conversation must end with a user message." Context compaction, previous_response_id
+  // expansion, subagent orchestration, and interrupted-turn replay can all produce a
+  // model-tail history. Append a user "(continue)" nudge, mirroring the anthropic adapter's
+  // tail guard (src/adapters/anthropic.ts).
+  const lastTurn = contents.length > 0 ? (contents[contents.length - 1] as { role?: string }) : undefined;
+  if (!lastTurn || lastTurn.role === "model") {
+    contents.push({ role: "user", parts: [{ text: "(continue)" }] });
   }
 
   return { systemInstruction, contents, replayedCallIds };
@@ -748,7 +798,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
       const stripRejectedClaudeSdkParagraph = provider.googleMode === "cloud-code-assist"
-        && parsed.modelId === "gemini-3.7-flash";
+        && rejectsClaudeSdkParagraph(parsed.modelId, routedModelId);
       const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(
         parsed,
         identityModelId,
@@ -856,17 +906,9 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           // fills a first functionCall that replay could not sign. Outside the cache branch too,
           // because the turn still needs a signature when no session was ever recorded.
           applyAntigravityThoughtSignatureFallback(wireModelId, contents);
-          // Claude-on-Antigravity rejects assistant-tail (model-tail in Gemini terms) histories
-          // as prefill: "This model does not support assistant message prefill. The conversation
-          // must end with a user message." Context compaction, previous_response_id expansion,
-          // and interrupted-turn replay can all produce a model-tail history. Append a user
-          // "(continue)" nudge, mirroring the anthropic adapter's tail guard (src/adapters/anthropic.ts).
-          if (/claude/i.test(wireModelId)) {
-            const last = contents.length > 0 ? contents[contents.length - 1] as { role?: string } : undefined;
-            if (!last || last.role === "model") {
-              contents.push({ role: "user", parts: [{ text: "(continue)" }] });
-            }
-          }
+          // The model-tail "(continue)" guard runs once, in messagesToGeminiFormat, so CCA,
+          // Vertex and AI Studio share one decision. A second check here would append a
+          // duplicate nudge whenever signature sanitization reshapes the tail afterwards.
         }
         const envelope = {
           model: wireModelId,

@@ -13,12 +13,29 @@ import {
   CURSOR_NO_VISION_MODELS,
   CURSOR_STATIC_MODELS,
   cursorModelContextWindows,
+  cursorModelDisplayNames,
   cursorModelIds,
   cursorModelInputModalities,
   cursorModelReasoningEfforts,
 } from "../adapters/cursor/discovery";
+import { cursorFastCapableBases } from "../adapters/cursor/catalog";
 import { COMMAND_CODE_MODEL_REASONING_EFFORTS } from "./command-code-efforts";
 import { isCanonicalOpenRouterTarget } from "./openrouter-routing";
+import {
+  CODEBUDDY_CN_MODELS,
+  CODEBUDDY_CN_MODEL_CONTEXT_WINDOWS,
+  CODEBUDDY_CN_MODEL_DEFAULT_REASONING_EFFORTS,
+  CODEBUDDY_CN_MODEL_MAX_OUTPUT_TOKENS,
+  CODEBUDDY_CN_MODEL_REASONING_EFFORTS,
+  CODEBUDDY_CN_NO_VISION_MODELS,
+  CODEBUDDY_GLOBAL_MODELS,
+  CODEBUDDY_GLOBAL_MODEL_CONTEXT_WINDOWS,
+  CODEBUDDY_GLOBAL_MODEL_DEFAULT_REASONING_EFFORTS,
+  CODEBUDDY_GLOBAL_MODEL_MAX_OUTPUT_TOKENS,
+  CODEBUDDY_GLOBAL_MODEL_REASONING_EFFORTS,
+  CODEBUDDY_REASONING_EFFORTS,
+} from "./codebuddy-models";
+import { QODER_CN_MODELS, QODER_GLOBAL_MODELS, QODER_REASONING_EFFORTS } from "./qoder-models";
 
 export type ProviderAuthKind = "forward" | "oauth" | "key" | "local";
 export type MetadataModelIdNormalize = "case-insensitive";
@@ -125,6 +142,7 @@ export interface ProviderRegistryEntry {
   adapter: string;
   baseUrl: string;
   apiKeyTransport?: OcxProviderConfig["apiKeyTransport"];
+  alias?: string;
   authKind: ProviderAuthKind;
   codexAccountMode?: CodexAccountMode;
   /** OAuth preset may explicitly honor a persisted API-key billing mode. */
@@ -157,6 +175,13 @@ export interface ProviderRegistryEntry {
   staticHeaders?: Record<string, string>;
   modelSuffixBracketStrip?: boolean;
   featured?: boolean;
+  /**
+   * Paid provider sponsorship under SPONSORS.md. `main` is reserved for model developers,
+   * `standard` for relays and gateways. The picker pins sponsor rows first (alphabetical among
+   * themselves) and labels them; nothing else reads this field. Routing, failover, quota, and
+   * defaults never consult it — that boundary is what SPONSORS.md promises users.
+   */
+  sponsor?: { tier: "main" | "standard"; url: string };
   dashboardPreset?: boolean;
   note?: string;
   dashboardUrl?: string;
@@ -270,6 +295,12 @@ export interface ProviderRegistryEntry {
   modelDiscovery?: ProviderModelDiscoverySpec;
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
+  /**
+   * Registry-supplied picker labels. Without these a routed row shows its raw slug,
+   * because `routedDisplayName` (codex/catalog/sync.ts) passes the slug through for every
+   * provider. An operator's `modelDisplayNames` still wins: derive only fills when absent.
+   */
+  modelDisplayNames?: Record<string, string>;
   modelInputModalities?: Record<string, string[]>;
   defaultMaxOutputTokens?: number;
   modelMaxOutputTokens?: Record<string, number>;
@@ -306,6 +337,7 @@ export interface ProviderRegistryEntry {
   preserveReasoningContentModels?: string[];
   requiresReasoningPlaceholderModels?: string[];
   reasoningSplitModels?: string[];
+  reasoningDetailsModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];
   escapeBuiltinToolNames?: boolean;
@@ -324,10 +356,11 @@ export type ProviderConfigSeed = Pick<
   OcxProviderConfig,
   "adapter" | "baseUrl" | "apiKeyTransport" | "responsesPath" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
   | "liveModels" | "contextWindow" | "modelContextWindows" | "modelInputModalities"
+  | "modelDisplayNames"
   | "modelMaxInputTokens" | "defaultMaxOutputTokens" | "modelMaxOutputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap" | "reasoningWireFormat"
   | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noPenaltyModels"
-  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance"
+  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance"
   | "googleMode" | "project" | "location" | "headers"
 >;
 
@@ -335,8 +368,42 @@ export type ProviderConfigSeed = Pick<
 // same static model seed.
 // 260710 context refresh: Tier-2 evidence in
 // devlog/_plan/260710_provider_hardening/001_research_frontier.md.
-const ANTHROPIC_MODELS = ["claude-fable-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"];
-const ANTHROPIC_MODEL_CONTEXT_WINDOWS: Record<string, number> = { "claude-sonnet-5": 1_000_000, "claude-fable-5": 1_000_000, "claude-opus-5": 1_000_000, "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000, "claude-opus-4-6": 1_000_000, "claude-sonnet-4-6": 1_000_000, "claude-haiku-4-5": 200_000 };
+// 260902 Claude Fable 5.1 (`claude-fable-5-1`): 1M context / 128K output / adaptive thinking
+// always on, per the official models overview and pricing page (platform.claude.com).
+const ANTHROPIC_MODELS = ["claude-fable-5-1", "claude-fable-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"];
+const ANTHROPIC_MODEL_CONTEXT_WINDOWS: Record<string, number> = { "claude-fable-5-1": 1_000_000, "claude-sonnet-5": 1_000_000, "claude-fable-5": 1_000_000, "claude-opus-5": 1_000_000, "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000, "claude-opus-4-6": 1_000_000, "claude-sonnet-4-6": 1_000_000, "claude-haiku-4-5": 200_000 };
+// Every current Claude family accepts at least 64k output tokens (Haiku 4.5 / Sonnet 4.x
+// through Opus 5 and Fable 5). Anthropic caps max_tokens per model server-side, so a
+// larger request never over-allocates; it only stops the 8192 truncation.
+const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
+/**
+ * The effort rungs opencodex exposes for native Anthropic models. Without this the
+ * providers advertised no ladder at all, so every client that keys its effort control off
+ * `reasoningEfforts` — Aside and the rest of the Pi-shaped exports — wrote these models
+ * with no control, while the SAME Claude models routed through `cursor` or
+ * `google-antigravity` had one.
+ *
+ * This is an opencodex ladder, not a claim that each model takes `output_config.effort`.
+ * The adapter serves two wire shapes (src/adapters/anthropic.ts): adaptive families
+ * (fable, sonnet >= 5, opus >= 4.7) send the effort directly, while opus 4.6, sonnet 4.6
+ * and haiku 4.5 take the legacy path where `reasoningBudget` TRANSLATES each rung into
+ * `thinking.budget_tokens`. Anthropic documents `low|medium|high|max` for the 4.6 models
+ * and no effort parameter at all for haiku 4.5; the budget translation is what makes five
+ * rungs meaningful there, and it clamps below `max_tokens` so none of them 400.
+ *
+ * Deliberately excluded, each because advertising it would offer a control that does not
+ * do what it says:
+ * - `minimal`: `adaptiveEffort` rewrites it to `low` (the adaptive wire 400s on it), so
+ *   it is not a distinct setting.
+ * - `none`: only sonnet >= 5 accepts an explicit thinking disable
+ *   (`EXPLICIT_THINKING_DISABLE_FAMILY_MINIMUMS`); Fable rejects one outright.
+ * - `ultra`: not an Anthropic concept, and it is degraded to `max` at the request
+ *   boundary anyway (src/responses/parser.ts).
+ */
+const ANTHROPIC_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const ANTHROPIC_MODEL_REASONING_EFFORTS: Record<string, string[]> = Object.fromEntries(
+  ANTHROPIC_MODELS.map(id => [id, [...ANTHROPIC_REASONING_EFFORTS]]),
+);
 
 // 260814 GLM-5.3 is registered pre-emptively alongside 5.2 everywhere 5.2 appears. Z.AI's
 // devpack "How to Switch Models" page (docs.z.ai/devpack/latest-model) lists glm-5.3 and
@@ -423,6 +490,32 @@ const OPENAI_API_GPT56_VIRTUAL_MODELS: Record<string, { wireModelId: string; rea
   "gpt-5.6-luna-pro": { wireModelId: "gpt-5.6-luna", reasoningMode: "pro" },
 };
 const OPENAI_API_GPT56_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+/*
+ * Meta Model API (https://api.meta.ai/v1) — published ladder, deliberately NOT the
+ * house set. dev.meta.ai/docs/reasoning lists "none", "minimal", "low", "medium",
+ * "high", "xhigh" and then excludes "none" for this family: "not supported by Muse
+ * Spark and returns HTTP 400". "max" and "ultra" are absent from the vendor's list
+ * entirely, so appending one by family resemblance would invent a wire value.
+ *
+ * Corroborated on a second surface: an unauthenticated OpenCode Zen probe of
+ * muse-spark-1.3-contributor-free (2026-09-03) accepted minimal..xhigh, rejected
+ * max/ultra with `unknown variant`, and rejected none with "does not support none
+ * with this model".
+ */
+const META_MUSE_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
+/*
+ * Identity wire map. `requestToCodexEffort` (src/reasoning-effort.ts) rewrites
+ * `minimal` to `low` unless a model-scoped wire map says otherwise, so without this
+ * the picker would advertise an effort the wire never sends — and a registry-array
+ * assertion would pass while the request body was wrong. Identity because Meta's
+ * values ARE the Codex names.
+ */
+const META_MUSE_REASONING_EFFORT_MAP: Record<string, string> = Object.fromEntries(
+  META_MUSE_REASONING_EFFORTS.map(effort => [effort, effort]),
+);
+/** Both Muse Spark 1.3 tiers publish a 1,048,576-token window (dev.meta.ai/docs/models). */
+const META_MUSE_CONTEXT_WINDOW = 1_048_576;
+const META_MUSE_MODELS = ["muse-spark-1.3", "muse-spark-1.3-contributor"];
 /**
  * Daybreak program aliases. These `-latest` ids are the stable contract: OpenAI repoints
  * them at newer snapshots over time (red -> gpt-5.6-cyber, blue -> gpt-5.6-sol as of
@@ -540,6 +633,8 @@ const COMMAND_CODE_IMAGE_MODELS = [
   "gpt-5.6-sol",
   "MiniMaxAI/MiniMax-M3",
   "moonshotai/Kimi-K3",
+  "meta/muse-spark-1.3",
+  "meta/muse-spark-1.3-contributor",
   "meta/muse-spark-1.2",
   "meta/muse-spark-1.2-contributor",
 ] as const;
@@ -560,7 +655,7 @@ const OPENCODE_FREE_DEEPSEEK_MODELS = ["deepseek-v4-flash-free"];
  * `mimo-v2.5-free` and `longcat-2.0-free` ACCEPT images and are deliberately
  * absent. Adding them would silently replace a working image with a caption,
  * which is worse than the loud 400 this list exists to prevent — see the negative
- * assertion in tests/provider-registry-parity.test.ts.
+ * assertion in tests/providers/provider-registry-parity.test.ts.
  *
  * Zen's roster is discovered live while this list is static, so it is a dated
  * exception list, not a capability model. Re-probe before extending it.
@@ -616,7 +711,7 @@ const DEEPSEEK_FLASH_REASONING_MAP: Record<string, string> = {
 /**
  * Flash-versus-Pro classification for DeepSeek V4 model ids, including prefixed
  * (`deepseek/deepseek-v4-pro`) and suffixed (`deepseek-v4-flash-free`) forms.
- * `tests/provider-registry-parity.test.ts` enumerates every id the registry
+ * `tests/providers/provider-registry-parity.test.ts` enumerates every id the registry
  * actually passes here, so a future id this substring test would misread cannot
  * land silently.
  */
@@ -1049,6 +1144,45 @@ const CLINE_PASS_MODELS = [
   "cline-pass/qwen3.7-max",
   "cline-pass/qwen3.7-plus",
 ];
+
+const ORCAROUTER_MODEL_DISCOVERY: ProviderModelDiscoverySpec = {
+  path: "models",
+  query: { capability: "chat" },
+  maxResponseBytes: 512 * 1024,
+  maxModels: 512,
+  filter: {
+    anyOf: [{
+      path: ["supported_endpoint_types"],
+      containsAny: ["openai", "openai-response", "anthropic", "gemini"],
+      caseInsensitive: true,
+    }],
+    noneOf: [{
+      path: ["supported_endpoint_types"],
+      containsAny: ["image-generation", "openai-video", "jina-rerank"],
+      caseInsensitive: true,
+    }],
+  },
+};
+// Preserve the previously verified cold-start catalog. Live discovery remains authoritative
+// when it succeeds, but a temporary catalog outage must not erase the provider's known-good
+// selectors from the picker. `orcarouter/auto` is intentionally retained here even though the
+// public catalog did not enumerate it at the latest verification (2026-09-07).
+const ORCAROUTER_MODELS = [
+  "openai/gpt-5.5",
+  "anthropic/claude-opus-4.8",
+  "google/gemini-3.5-flash",
+  "deepseek/deepseek-v4-pro",
+  "orcarouter/auto",
+];
+const ORCAROUTER_TEXT_ONLY_MODELS = ["deepseek/deepseek-v4-pro"];
+const ORCAROUTER_MODEL_REASONING_EFFORTS = {
+  // Live /models currently exposes ids and modalities, not the accepted reasoning ladder.
+  "openai/gpt-5.5": ["low", "medium", "high", "xhigh"],
+  "deepseek/deepseek-v4-pro": deepseekThinkingEffortsFor("deepseek/deepseek-v4-pro"),
+};
+const ORCAROUTER_MODEL_REASONING_EFFORT_MAP = {
+  "deepseek/deepseek-v4-pro": deepseekReasoningMapFor("deepseek/deepseek-v4-pro"),
+};
 const CLINE_PASS_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   "cline-pass/glm-5.3": 1_048_576,
   "cline-pass/glm-5.3-flash": 1_048_576,
@@ -1108,6 +1242,16 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     liveModels: true,
     defaultModel: "auto",
     modelContextWindows: cursorModelContextWindows(CURSOR_STATIC_MODELS),
+    modelDisplayNames: cursorModelDisplayNames(),
+    // Cursor's Fast product is a model VARIANT, not a service_tier field, so the wire kind
+    // is cursor-variant and the request builder consumes the decision.
+    fastWire: { kind: "cursor-variant", canonicalToWire: { priority: "fast" }, foreignCallerTiers: "drop" },
+    // Deliberately NO provider-level supportsServiceTier: resolveFastPolicy short-circuits on
+    // `capability.provider === false` BEFORE consulting the per-model map, which would make
+    // these entries dead config. Absent leaves unlisted bases "unclassified", and a
+    // non-service-tier adapter cannot forward a caller tier, so they still publish no toggle.
+    modelSupportsServiceTier: Object.fromEntries(cursorFastCapableBases().map(id => [id, true])),
+    fastTierDescription: "Cursor Fast variant",
     modelInputModalities: cursorModelInputModalities(CURSOR_STATIC_MODELS),
     modelReasoningEfforts: cursorModelReasoningEfforts(CURSOR_STATIC_MODELS),
     // Kimi K3 documents `max` as its API default, and its Cursor ladder has no `medium`
@@ -1172,20 +1316,20 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // than the seeded ones do.
     supportsVerbosity: false,
     defaultModel: "grok-4.5",
-    // Keep 4.6/4.5 Responses callers on the compatibility Chat wire until xAI can replay
-    // opaque reasoning continuation and compaction state across later turns. Multi-agent has
-    // no Chat wire, so Responses callers use its only working wire under both auth modes.
+    // Grok 4.6/4.5 subscription Responses callers use the native wire with the existing
+    // namespace/web-search/replay normalization. Chat remains an explicit modelAdapters
+    // opt-in. Multi-agent has no Chat wire and uses Responses under both auth modes.
     // Caller-owned service tiers stay off the unclassified OAuth subscription route; key-auth
     // Fast remains proxy-owned and is still selected through keyAuthServiceTier above.
     modelWireDefaults: {
       "grok-4.6": {
-        wire: "openai-chat",
+        wire: "openai-responses",
         inbound: ["responses"],
         authModes: ["oauth"],
         forwardCallerServiceTier: false,
       },
       "grok-4.5": {
-        wire: "openai-chat",
+        wire: "openai-responses",
         inbound: ["responses"],
         authModes: ["oauth"],
         forwardCallerServiceTier: false,
@@ -1278,6 +1422,25 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     parallelToolCalls: false,
   },
   {
+    id: "orcarouter-oauth",
+    label: "OrcaRouter - Auth",
+    adapter: "openai-chat",
+    baseUrl: "https://api.orcarouter.ai/v1",
+    authKind: "oauth",
+    oauthId: "orcarouter-oauth",
+    featured: true,
+    allowBaseUrlOverride: true,
+    defaultModel: "openai/gpt-5.5",
+    models: ORCAROUTER_MODELS,
+    liveModels: true,
+    modelDiscovery: ORCAROUTER_MODEL_DISCOVERY,
+    noVisionModels: ORCAROUTER_TEXT_ONLY_MODELS,
+    modelReasoningEfforts: ORCAROUTER_MODEL_REASONING_EFFORTS,
+    modelReasoningEffortMap: ORCAROUTER_MODEL_REASONING_EFFORT_MAP,
+    preserveReasoningContentModels: ORCAROUTER_TEXT_ONLY_MODELS,
+    note: "Connect your OrcaRouter account with OAuth 2.0 + PKCE; the issued API key is stored in OpenCodex's existing credential store.",
+  },
+  {
     id: "anthropic",
     label: "Anthropic Claude",
     adapter: "anthropic",
@@ -1290,6 +1453,10 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     note: "Log in with your Claude account",
     models: [...ANTHROPIC_MODELS],
     modelContextWindows: { ...ANTHROPIC_MODEL_CONTEXT_WINDOWS },
+    modelReasoningEfforts: { ...ANTHROPIC_MODEL_REASONING_EFFORTS },
+    // Codex omits max_output_tokens; without a provider budget the Anthropic adapter
+    // falls back to 8192, which truncates long answers with stop_reason=max_tokens.
+    defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
     defaultModel: "claude-sonnet-5",
   },
   {
@@ -1306,6 +1473,8 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     models: [...ANTHROPIC_MODELS],
     liveModels: true,
     modelContextWindows: { ...ANTHROPIC_MODEL_CONTEXT_WINDOWS },
+    modelReasoningEfforts: { ...ANTHROPIC_MODEL_REASONING_EFFORTS },
+    defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
     defaultModel: "claude-sonnet-5",
   },
   {
@@ -1392,8 +1561,10 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     modelDiscovery: {
       // Resolves against effectiveBaseUrl (registry baseUrl .../v1) to the same
       // canonical endpoint https://inference-api.nousresearch.com/v1/models.
+      // Nous returns a mixed paid/free catalog whose JSON can exceed 256 KiB;
+      // keep the provider-specific limit below the process-wide 4 MiB ceiling.
       path: "models",
-      maxResponseBytes: 262_144,
+      maxResponseBytes: 1_048_576,
       maxModels: 512,
     },
     note: "Nous Research subscription gateway. OAuth device login with your own Portal account; mixed paid + :free models discovered live (fallback seed 2026-08-10: tencent/hy3:free, poolside/laguna-s-2.1:free, stepfun/step-3.7-flash:free, poolside/laguna-xs-2.1:free).",
@@ -1408,12 +1579,13 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     featured: true,
     dashboardUrl: "https://platform.openai.com/api-keys",
     defaultModel: "gpt-5.5",
-    models: ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS],
+    models: ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra"],
     liveModels: true,
-    modelContextWindows: { ...OPENAI_API_GPT56_CONTEXT_WINDOWS, ...OPENAI_DAYBREAK_CONTEXT_WINDOWS },
-    modelMaxInputTokens: { ...OPENAI_API_GPT56_MAX_INPUT_TOKENS, ...OPENAI_DAYBREAK_MAX_INPUT_TOKENS },
+    modelContextWindows: { ...OPENAI_API_GPT56_CONTEXT_WINDOWS, ...OPENAI_DAYBREAK_CONTEXT_WINDOWS, "gpt-6-astra": 1_050_000 },
+    modelMaxInputTokens: { ...OPENAI_API_GPT56_MAX_INPUT_TOKENS, ...OPENAI_DAYBREAK_MAX_INPUT_TOKENS, "gpt-6-astra": 922_000 },
+    modelMaxOutputTokens: { "gpt-6-astra": 128_000 },
     modelInputModalities: Object.fromEntries(
-      ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS]
+      ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra"]
         .map(id => [id, ["text", "image"]]),
     ),
     modelReasoningEfforts: {
@@ -1421,8 +1593,77 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
         [...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS].map(id => [id, OPENAI_API_GPT56_REASONING_EFFORTS]),
       ),
       ...OPENAI_DAYBREAK_REASONING_EFFORTS,
+      "gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
     },
     virtualModels: OPENAI_API_GPT56_VIRTUAL_MODELS,
+  },
+  /* [Decision Log]
+  - 목적과 의도: Reach Meta's Muse Spark models directly on Meta's own Model API, instead of only through the Command Code and OpenCode Zen resellers already in this registry.
+  - 기존 구현 및 제약 조건: Meta publishes both POST /v1/responses and POST /v1/chat/completions at https://api.meta.ai/v1, and no API key was issued for this change — every value here comes from the published spec (devlog/_plan/260903_muse_spark_plan_oauth/001).
+  - 검토한 주요 대안: register as openai-chat; use provider id "meta"; enable live discovery; wire the Muse Code subscription credential as OAuth.
+  - 선택한 방식: an openai-responses key provider under the id "meta-model", with a static two-model roster and no OAuth.
+  - 다른 대안 대신 이 방식을 선택한 이유: Meta calls Responses "the recommended default for new work ... OpenAI-compatible and exposes the full feature set", carrying reasoning replay and native input_image that Chat would forfeit. The id is "meta-model" because "meta" would capture the LIVE Command Code selector meta/muse-spark-1.3 at router.ts's provider-prefix branch, and would derive META_API_KEY — the Muse Code CLI's variable, not this API's MODEL_API_KEY.
+  - 장점, 단점 및 영향: users reach Muse Spark without a reseller; discovery stays off until an authenticated /v1/models payload is actually observed, so an unseen roster (Meta also serves image and voice families here) cannot leak into the picker.
+  */
+  {
+    id: "meta-model",
+    label: "Meta Model API",
+    adapter: "openai-responses",
+    baseUrl: "https://api.meta.ai/v1",
+    authKind: "key",
+    dashboardUrl: "https://dev.meta.ai/docs/authentication",
+    defaultModel: "muse-spark-1.3",
+    models: META_MUSE_MODELS,
+    // Static roster: no authenticated /v1/models payload was ever observed (the only
+    // contact was an unauthenticated GET returning 401 invalid_api_key), and Meta serves
+    // non-agent families on this same base URL. Turning discovery on would publish an
+    // unseen roster into the picker.
+    liveModels: false,
+    // A user may already own a custom provider named "meta-model" pointing elsewhere;
+    // without this, registry transport canonicalization would retarget it and send their
+    // saved key to Meta.
+    preserveCustomDestination: true,
+    modelContextWindows: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_CONTEXT_WINDOW])),
+    // text+image only. Meta also documents video, audio (degraded on 1.3), and PDF, but
+    // the catalog modality enum is text/image and over-advertising poisons the exported
+    // client config (see tests/codex-integration/catalog-input-modality-enum.test.ts).
+    modelInputModalities: Object.fromEntries(META_MUSE_MODELS.map(id => [id, ["text", "image"] as ["text", "image"]])),
+    modelReasoningEfforts: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORTS])),
+    modelReasoningEffortMap: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORT_MAP])),
+    // No defaultMaxOutputTokens: Meta publishes none. The only number in its docs
+    // (131072) appears inside a third-party config sample, and the protocol pages call
+    // the real limit "model-dependent".
+    // Meta names its variable MODEL_API_KEY, but the env var opencodex reads is derived
+    // from the provider id (META_MODEL_API_KEY). Saying only Meta's name would send a
+    // user to export a variable this proxy never reads.
+    note: "Pay-as-you-go Meta Model API. Get a key at https://dev.meta.ai (Meta calls it MODEL_API_KEY; export it here as META_MODEL_API_KEY) — a Meta developer account needs a payment method before it can serve requests, and every call is metered per token. A Muse Code subscription does NOT work here: Meta scopes that credential to the Muse Code CLI and bills any other key pay-as-you-go (dev.meta.ai/docs/muse-code/subscriptions). The Contributor tier (muse-spark-1.3-contributor) is cheap because Meta trains on your prompts — about 92% off input, 95% off output, 99% off cached input; do not send confidential material through it. Muse Spark is also reachable through resellers: command-code carries both tiers, opencode-go serves only muse-spark-1.3-contributor.",
+  },
+  /* [Decision Log]
+  - 목적과 의도: Let an operator who already signed the Muse Code CLI in reach Muse Spark with that credential, instead of provisioning a second key.
+  - 기존 구현 및 제약 조건: The CLI stores a pointer at ~/.config/muse/auth.json and the secret in the macOS Keychain (ai.meta.dev.credentials/meta). Measured: the OAuth access_token 401s on /v1/models while the sibling api_key returns 200, so the usable artifact is a static key, not a refreshable token.
+  - 검토한 주요 대안: spawn `muse login` and poll; reimplement Meta's device grant; treat it as a second key preset; ship nothing.
+  - 선택한 방식: an OAuth provider that imports the existing credential on macOS and accepts a pasted key elsewhere, validates either once, and never spawns or reimplements anything.
+  - 다른 대안 대신 이 방식을 선택한 이유: `muse login` has no non-interactive mode, so a spawned child could outlive cancellation, and polling for the pointer file is satisfied instantly by the one already on disk — reimporting the OLD account on a force-login. Reimplementing the grant would mean guessing a client id the vendor does not publish.
+  - 장점, 단점 및 영향: no new credential to provision, and the id is distinct from meta-model so neither pool contaminates the other. Meta scopes this credential to its own CLI, so the provider carries a HIGH_RISK ToS warning, a CLI-side warning before any read, and a note that says plainly what is unsupported.
+  */
+  {
+    id: "meta-muse",
+    label: "Meta Muse Code (CLI credential)",
+    adapter: "openai-responses",
+    baseUrl: "https://api.meta.ai/v1",
+    authKind: "oauth",
+    oauthId: "meta-muse",
+    dashboardUrl: "https://dev.meta.ai",
+    defaultModel: "muse-spark-1.3",
+    models: META_MUSE_MODELS,
+    // Same reason as meta-model: the authenticated roster carries muse-image-1.0 and
+    // muse-voice-transcribe-1.0, which this Responses-agent provider cannot drive.
+    liveModels: false,
+    modelContextWindows: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_CONTEXT_WINDOW])),
+    modelInputModalities: Object.fromEntries(META_MUSE_MODELS.map(id => [id, ["text", "image"] as ["text", "image"]])),
+    modelReasoningEfforts: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORTS])),
+    modelReasoningEffortMap: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORT_MAP])),
+    note: "Reuses the API key the Muse Code CLI stores after `muse login` (macOS only; requires the CLI installed and signed in). Meta ships no native Windows CLI and the Linux credential storage has not been measured, so on those platforms OpenCodex asks you to paste the Muse Code API key from https://dev.meta.ai instead of importing one; a pasted key faces the same format check and live validation as an imported one. Meta scopes that credential to the Muse Code CLI, so this is an UNSUPPORTED use: Meta does not authorize subscription coverage outside its own CLI, how these calls settle is not observable from the API, and you should treat every call as billable against your account. The key, imported or pasted, is copied into OpenCodex's auth store. OpenCodex reads Meta's subscription windows from streaming responses and shows the last observed value with its age; there is no endpoint to query them on demand, so refreshing one requires another streaming turn, and translated (non-passthrough) turns report none. Rate limits apply per team, not per key. For a supported path use the meta-model provider with your own key (export it as META_MODEL_API_KEY).",
   },
   {
     id: "umans",
@@ -1457,37 +1698,50 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // Zen Go can close a Chat stream after a fully assembled function call without sending
     // finish_reason or [DONE] (#2260). The adapter still rejects incomplete argument JSON.
     openaiChatEofTolerance: true,
+    // Go rejects reasoning.encrypted_content with previous_response_id (#3838).
+    // Use explicit replay history and the existing stateless Responses policy.
+    statelessResponses: true,
     /* [Decision Log]
-    - 목적과 의도: Route the exact models OpenCode Go documents on the Responses endpoint — GPT 5.6 Luna, and Muse Spark 1.2 Contributor (#2617).
+    - 목적과 의도: Route the exact models OpenCode Go documents on the Responses endpoint — GPT 5.6 Luna, Grok 4.6, and Muse Spark Contributor (#2617).
     - 기존 구현 및 제약 조건: The provider is mixed-wire but its provider-wide `openai-chat` adapter sent Luna to `/chat/completions`; explicit user `modelAdapters` entries must remain authoritative.
     - 검토한 주요 대안: Change the whole provider to Responses; infer the wire from model-family names; add one registry-only exact-model default.
     - 선택한 방식: Declare only the named models as `openai-responses` through the existing registry default mechanism; the map stays an exact-model allowlist rather than a family or provider-wide rule.
     - 다른 대안 대신 이 방식을 선택한 이유: OpenCode Go documents sibling models on Chat or Anthropic endpoints, and an exact registry default preserves both those routes and explicit opt-out precedence.
     - 장점, 단점 및 영향: Each listed model reaches `/responses` from every inbound surface without changing siblings; a future upstream endpoint change requires an evidence-backed registry update.
     */
-    modelWireDefaults: { "gpt-5.6-luna": "openai-responses", "muse-spark-1.2-contributor": "openai-responses" },
+    modelWireDefaults: {
+      "gpt-5.6-luna": "openai-responses",
+      "grok-4.6": "openai-responses",
+      "muse-spark-1.3-contributor": "openai-responses",
+      "muse-spark-1.2-contributor": "openai-responses",
+    },
     modelContextWindows: {
       "kimi-k3": KIMI_K3_STANDARD_CONTEXT_WINDOW,
       // The DeepSeek vision preview id is metadata-only here: the Go roster is
       // discovered live, so it applies the moment the gateway serves the id.
       [DEEPSEEK_VISION_PREVIEW_MODEL]: 1_048_576,
-      // Muse Spark 1.2 Contributor serves a 1,048,576-token (1M) context window over
+      // Muse Spark Contributor serves a 1,048,576-token (1M) context window over
       // /responses on Zen Go, matching its 1.1 sibling (Meta developer docs, verified 2026-08-28).
       // Without this declaration the catalog falls back to 128k, capping real usable context.
+      // 1.3 ships the same window as 1.2 and is served from the same Zen Go roster.
+      "muse-spark-1.3-contributor": 1_048_576,
       "muse-spark-1.2-contributor": 1_048_576,
     },
     modelInputModalities: {
       "kimi-k3": ["text", "image"],
       // Experimental DeepSeek vision preview — expected to merge into deepseek-v4-flash later.
       [DEEPSEEK_VISION_PREVIEW_MODEL]: ["text", "image"],
-      // Muse Spark 1.2 Contributor is natively multimodal on Zen Go: it accepts input_image
+      // Muse Spark Contributor is natively multimodal on Zen Go: it accepts input_image
       // parts over /responses (probed 2026-08-26). Without this declaration the catalog
       // advertises it text-only and the Codex app blocks image attachments client-side with
       // "This model does not support image inputs" before the request ever reaches the proxy.
+      // 1.3 is the same-shaped successor and Command Code documents it as multimodal.
+      "muse-spark-1.3-contributor": ["text", "image"],
       "muse-spark-1.2-contributor": ["text", "image"],
     },
     modelReasoningEfforts: {
       "gpt-5.6-luna": OPENAI_API_GPT56_REASONING_EFFORTS,
+      "grok-4.6": ["low", "medium", "high", "xhigh"],
       "glm-5.3": ZAI_GLM_53_REASONING_EFFORTS,
       "glm-5.3-flash": ZAI_GLM_53_REASONING_EFFORTS,
       "glm-5.2": ZAI_GLM_52_REASONING_EFFORTS,
@@ -1499,7 +1753,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       ...Object.fromEntries(OPENCODE_GO_THINKING_BUDGET_MODELS.map(id => [id, THINKING_BUDGET_EFFORTS])),
       ...Object.fromEntries(DEEPSEEK_THINKING_MODELS.map(id => [id, deepseekThinkingEffortsFor(id)])),
     },
-    modelDefaultReasoningEfforts: { "kimi-k3": "max" },
+    modelDefaultReasoningEfforts: { "grok-4.6": "high", "kimi-k3": "max" },
     // glm-5.2 uses identity labels now that `max` is a native Codex level (no alias map);
     // the thinking-toggle map is a REAL wire alias (effort -> enabled/disabled) and stays.
     modelReasoningEffortMap: {
@@ -1665,37 +1919,45 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     note: "Cline usage-billing API: one key, 100+ models, OpenRouter-style ids. Promotional free models are IDE/CLI-only per Cline docs; minimax/minimax-m2.5 is the documented API free experimentation model.",
   },
   {
-    // OrcaRouter: OpenAI-compatible adaptive router (api.orcarouter.ai). Model ids are
-    // vendor-namespaced (`<vendor>/<model>`) and pass through to the upstream as-is.
-    // The default pins a tool-capable model; the adaptive `orcarouter/auto` router is also
-    // selectable. Live-verified 2026-07-20: /v1/chat/completions accepts the `tools` field
-    // and routes to a function-calling-capable upstream.
-    id: "orcarouter", label: "OrcaRouter", adapter: "openai-chat", baseUrl: "https://api.orcarouter.ai/v1",
+    // OrcaRouter: OpenAI-compatible adaptive router (api.orcarouter.ai). The public live
+    // catalog is authoritative; model ids and input modalities are never maintained here.
+    id: "orcarouter", label: "OrcaRouter - API", adapter: "openai-chat", baseUrl: "https://api.orcarouter.ai/v1",
     authKind: "key", dashboardUrl: "https://www.orcarouter.ai/console",
+    // The catalog is public, so a successful /models probe cannot validate a submitted key.
+    apiKeyValidation: "unknown",
+    // Standard sponsor under SPONSORS.md (agreement signed 2026-09-07). Pins the row in the
+    // picker and adds the chip; nothing about routing or defaults changes.
+    sponsor: { tier: "standard", url: "https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme" },
     defaultModel: "openai/gpt-5.5",
-    models: [
-      "openai/gpt-5.5",
-      "anthropic/claude-opus-4.8",
-      "google/gemini-3.5-flash",
-      "deepseek/deepseek-v4-pro",
-      "orcarouter/auto",
-    ],
-    // Text-only models → the vision sidecar describes images instead.
-    noVisionModels: ["deepseek/deepseek-v4-pro"],
-    // Reasoning/temperature behavior verified live 2026-07-20 against api.orcarouter.ai:
-    // - openai/gpt-5.5 accepts reasoning_effort none|low|medium|high|xhigh but rejects `max` (400),
-    //   so advertise up to xhigh and let mapReasoningEffort clamp a `max`/`ultra` request to xhigh.
-    // - deepseek/deepseek-v4-pro mirrors the direct-DeepSeek wiring (thinking-effort map +
-    //   reasoning_content history replay) so the namespaced selection behaves identically.
-    // - temperature is accepted by every seeded model (gpt-5.5, claude-opus-4.8, deepseek-v4-pro all
-    //   returned 200), so no noTemperatureModels entry is warranted here.
-    modelReasoningEfforts: {
-      "openai/gpt-5.5": ["low", "medium", "high", "xhigh"],
-      "deepseek/deepseek-v4-pro": deepseekThinkingEffortsFor("deepseek/deepseek-v4-pro"),
-    },
-    modelReasoningEffortMap: { "deepseek/deepseek-v4-pro": deepseekReasoningMapFor("deepseek/deepseek-v4-pro") },
-    preserveReasoningContentModels: ["deepseek/deepseek-v4-pro"],
-    note: "OpenAI-compatible adaptive router. Default is a tool-capable model; orcarouter/auto (adaptive routing) is also selectable. Full catalog: https://www.orcarouter.ai/models",
+    models: ORCAROUTER_MODELS,
+    liveModels: true,
+    modelDiscovery: ORCAROUTER_MODEL_DISCOVERY,
+    // Catalog discovery owns WHICH models exist. These entries only retain verified
+    // request-shaping facts that the upstream catalog does not currently publish.
+    noVisionModels: ORCAROUTER_TEXT_ONLY_MODELS,
+    modelReasoningEfforts: ORCAROUTER_MODEL_REASONING_EFFORTS,
+    modelReasoningEffortMap: ORCAROUTER_MODEL_REASONING_EFFORT_MAP,
+    preserveReasoningContentModels: ORCAROUTER_TEXT_ONLY_MODELS,
+    note: "OpenAI-compatible adaptive router. Models and multimodal capabilities are discovered live from the public chat catalog. Use the OrcaRouter account entry for PKCE login.",
+  },
+  {
+    // PackyCode: API relay (packyapi.com) for Claude Code, Codex, Gemini and more. Codex traffic
+    // uses the OpenAI-compatible host from their Codex/Kimi Code guides (docs.packyapi.com):
+    // https://cf.api.fan/v1 — GET /v1/models answers 401 without a key, so the host is live and
+    // discovery narrows to what the key's token group allows. Model ids are bare OpenAI-style
+    // ids (the Codex token group lists gpt-5.5 / gpt-5.1-codex).
+    // Standard sponsor under SPONSORS.md; the dashboardUrl carries their affiliate code.
+    id: "packycode", label: "PackyCode", adapter: "openai-chat", baseUrl: "https://cf.api.fan/v1",
+    authKind: "key", dashboardUrl: "https://www.packyapi.com/register?aff=k5KT",
+    sponsor: { tier: "standard", url: "https://www.packyapi.com/register?aff=k5KT" },
+    defaultModel: "gpt-5.5",
+    models: ["gpt-5.5", "gpt-5.1-codex"],
+    liveModels: true,
+    // New key preset: opt into collision preservation so a row named `packycode` that a user
+    // points at a different PackyCode host keeps its own destination instead of being pulled
+    // back onto the Codex endpoint below.
+    preserveCustomDestination: true,
+    note: "API relay for Claude Code, Codex, Gemini and more. Create a Codex-group token at packyapi.com; live discovery lists what the token group allows.",
   },
   {
     // BizRouter: Korean enterprise LLM gateway (api.bizrouter.ai). Model ids are
@@ -1714,13 +1976,17 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
   // devlog/_plan/260710_provider_hardening/001_research_frontier.md.
   {
     id: "google", label: "Google Gemini", adapter: "google", baseUrl: "https://generativelanguage.googleapis.com", authKind: "key", featured: true,
-    dashboardUrl: "https://aistudio.google.com/apikey", defaultModel: "gemini-3.5-flash", models: ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.7-flash"],
-    modelContextWindows: { "gemini-3.6-flash": 1_048_576, "gemini-3.5-flash": 1_000_000, "gemini-3.5-flash-lite": 1_048_576, "gemini-3.7-flash": 1_048_576 },
-    modelInputModalities: { "gemini-3.6-flash": ["text", "image"], "gemini-3.5-flash-lite": ["text", "image"], "gemini-3.7-flash": ["text", "image"] },
+    dashboardUrl: "https://aistudio.google.com/apikey", defaultModel: "gemini-3.5-flash", models: ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.7-flash"],
+    modelContextWindows: { "gemini-3.8-flash": 1_048_576, "gemini-3.6-flash": 1_048_576, "gemini-3.5-flash": 1_000_000, "gemini-3.5-flash-lite": 1_048_576, "gemini-3.7-flash": 1_048_576 },
+    modelInputModalities: { "gemini-3.8-flash": ["text", "image"], "gemini-3.6-flash": ["text", "image"], "gemini-3.5-flash-lite": ["text", "image"], "gemini-3.7-flash": ["text", "image"] },
     modelReasoningEfforts: {
+      // 3.7 and 3.8 omit `minimal`: Google documents it as a validation error on both model
+      // pages, so advertising it hands the user a rung the API rejects. 3.5/3.6 keep theirs —
+      // their pages still list it, and this unit has no evidence to change them.
+      "gemini-3.8-flash": ["low", "medium", "high"],
+      "gemini-3.7-flash": ["low", "medium", "high"],
       "gemini-3.6-flash": ["minimal", "low", "medium", "high"],
       "gemini-3.5-flash": ["minimal", "low", "medium", "high"],
-      "gemini-3.7-flash": ["minimal", "low", "medium", "high"],
       "gemini-3.1-pro-preview": ["low", "medium", "high"],
     },
     jawcodeBundle: "google", extraMetadataAliases: ["gemini"],
@@ -1728,7 +1994,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
   // 2026-07-10: defaultModel is frozen pending Vertex-specific Tier-2 evidence; Gemini API
   // evidence from ai.google.dev does not establish Vertex publisher availability.
   { id: "google-vertex", label: "Google Vertex AI", adapter: "google", baseUrl: "https://aiplatform.googleapis.com", authKind: "key", dashboardUrl: "https://console.cloud.google.com/vertex-ai", defaultModel: "gemini-3-pro", googleMode: "vertex", jawcodeBundle: "google", extraMetadataAliases: ["gemini-vertex"] },
-  { id: "google-antigravity", label: "Google Antigravity", adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authKind: "oauth", allowBaseUrlOverride: true, dashboardUrl: "https://antigravity.google", models: ANTIGRAVITY_MODELS, liveModels: true, defaultModel: "gemini-3.7-flash", modelContextWindows: ANTIGRAVITY_MODEL_CONTEXT_WINDOWS, modelInputModalities: ANTIGRAVITY_MODEL_INPUT_MODALITIES, modelReasoningEfforts: ANTIGRAVITY_MODEL_EFFORTS, googleMode: "cloud-code-assist", jawcodeBundle: "google", extraMetadataAliases: ["antigravity", "gemini-antigravity"] },
+  { id: "google-antigravity", alias: "agy", label: "Google Antigravity", adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authKind: "oauth", allowBaseUrlOverride: true, dashboardUrl: "https://antigravity.google", models: ANTIGRAVITY_MODELS, liveModels: true, defaultModel: "gemini-3.8-flash", modelContextWindows: ANTIGRAVITY_MODEL_CONTEXT_WINDOWS, modelInputModalities: ANTIGRAVITY_MODEL_INPUT_MODALITIES, modelReasoningEfforts: ANTIGRAVITY_MODEL_EFFORTS, googleMode: "cloud-code-assist", jawcodeBundle: "google", extraMetadataAliases: ["antigravity", "gemini-antigravity"] },
   { id: "azure-openai", label: "Azure OpenAI", adapter: "azure-openai", baseUrl: "https://{resource}.openai.azure.com/openai", authKind: "key", featured: true, dashboardUrl: "https://portal.azure.com" },
   { id: "ollama", label: "Ollama (local)", adapter: "openai-chat", baseUrl: "http://localhost:11434/v1", authKind: "local", allowPrivateNetworkByDefault: true, allowBaseUrlOverride: true, featured: true, note: "Local — key usually blank" },
   { id: "vllm", label: "vLLM (local)", adapter: "openai-chat", baseUrl: "http://localhost:8000/v1", authKind: "local", allowPrivateNetworkByDefault: true, allowBaseUrlOverride: true, featured: true, note: "Local — key usually blank" },
@@ -2002,6 +2268,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     liveModels: true,
     preserveCustomDestination: true,
     defaultModel: "deepseek/deepseek-v4-flash",
+    promptCacheKey: true,
     // The default is also the cold-start seed: live discovery failure must not empty the catalog
     // for a freshly configured provider with no stale cache (issue #308 pattern).
     models: ["deepseek/deepseek-v4-flash"],
@@ -2370,6 +2637,37 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // yields an empty picker at runtime.
     note: "Domestic BigModel Coding Plan endpoint (open.bigmodel.cn)",
   },
+  // Narrowed carry of #3641: the official Codex example declares a local static catalog,
+  // not an HTTP /models contract. Keep Responses separate from the Chat endpoint above.
+  // Source: https://docs.bigmodel.cn/cn/coding-plan/tool/codex.md (checked 2026-09-07).
+  {
+    id: "zhipu-bigmodel-responses",
+    label: "Zhipu AI — BigModel Coding Plan (Responses)",
+    baseUrl: "https://open.bigmodel.cn/api/v1",
+    adapter: "openai-responses",
+    authKind: "key",
+    dashboardUrl: "https://bigmodel.cn/console/usercenter/apikeys",
+    defaultModel: "glm-5.3",
+    models: ["glm-5.3", "glm-5-turbo"],
+    liveModels: false,
+    // The local Codex catalog does not establish an authenticated HTTP /models contract.
+    apiKeyValidation: "unknown",
+    jawcodeBundle: "zai",
+    // A pre-existing same-named custom provider must retain its destination and key boundary.
+    preserveCustomDestination: true,
+    modelContextWindows: { "glm-5.3": 1_048_576, "glm-5-turbo": 204_800 },
+    modelInputModalities: { "glm-5.3": ["text"], "glm-5-turbo": ["text"] },
+    modelReasoningEfforts: {
+      "glm-5.3": ZAI_GLM_53_REASONING_EFFORTS,
+      // Explicitly empty: Turbo must not inherit the generic selectable effort ladder.
+      "glm-5-turbo": [],
+    },
+    modelDefaultReasoningEfforts: { "glm-5.3": "max", "glm-5-turbo": "max" },
+    modelSupportsReasoningSummaries: { "glm-5.3": true, "glm-5-turbo": true },
+    // Responses replay uses this provider-level flag, not the Chat-path model list.
+    preserveResponsesReasoningContent: true,
+    note: "Domestic BigModel Coding Plan Responses endpoint; static model roster",
+  },
   { id: "nanogpt", label: "NanoGPT", baseUrl: "https://nano-gpt.com/api/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://nano-gpt.com/api" },
   { id: "synthetic", label: "Synthetic", baseUrl: "https://api.synthetic.new/openai/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://synthetic.new" },
   // SiliconFlow publishes an OpenAI-compatible chat endpoint and a dynamic model catalog. Do not
@@ -2642,6 +2940,13 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // never a fabricated placeholder (chatgpt-codex-connector P2 on #1205).
     requiresReasoningPlaceholderModels: [],
     reasoningSplitModels: MINIMAX_MODELS,
+    // With reasoning_split the upstream returns thinking as a structured
+    // reasoning_details array (cumulative text snapshots per stream chunk) and
+    // requires that array back verbatim on the next turn — a reasoning_content
+    // string replay is the native-format pass-back the docs say is unsupported.
+    // Evidence: platform.minimax.io/docs/guides/text-m3-function-call and
+    // /docs/api-reference/text-openai-api (verified 2026-09-01).
+    reasoningDetailsModels: MINIMAX_MODELS,
     thinkingToggleModels: ["MiniMax-M3"],
     jawcodeBundle: "minimax", metadataModelIdNormalize: "case-insensitive", note: "Subscription Key or API Key",
   },
@@ -2655,6 +2960,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     preserveReasoningContentModels: MINIMAX_MODELS,
     requiresReasoningPlaceholderModels: [],
     reasoningSplitModels: MINIMAX_MODELS,
+    reasoningDetailsModels: MINIMAX_MODELS,
     thinkingToggleModels: ["MiniMax-M3"],
     jawcodeBundle: "minimax", metadataModelIdNormalize: "case-insensitive", note: "中国区 Subscription Key",
   },
@@ -2712,7 +3018,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     keyOptional: true,
     featured: true,
     liveModels: true,
-    note: "No key needed — public desktop tier. OpenCode currently advertises about 200 Big Pickle/free-model requests per 5 hours. The same Zen gateway can also short-window rate-limit free models at roughly 15-20 requests/minute, and may return generic 429s without Retry-After (opencodex synthesizes backoff only when that header is omitted). Free models are discovered live from Zen. Data use: per OpenCode's Zen docs (https://opencode.ai/docs/zen/), prompts sent to free models may be retained and used for training/improvement — do not send confidential material through this provider.",
+    note: "No key needed, but OpenCode now gates this tier to its own client: Zen refuses any request that arrives without an x-opencode-session header (error type MissingSessionID, \"OpenCode's free tier can only be used in OpenCode\"). opencodex does not mint that header or claim an OpenCode client identity, because no upstream contract authorizes a third-party agent to present itself as OpenCode. Until OpenCode publishes a third-party integration path for the keyless tier, use the keyed opencode-zen provider instead (https://opencode.ai/auth). Quota figures for when the tier admitted a request: OpenCode advertises about 200 Big Pickle/free-model requests per 5 hours, and the same Zen gateway can short-window rate-limit free models at roughly 15-20 requests/minute, and may return generic 429s without Retry-After (opencodex synthesizes backoff only when that header is omitted). Free models are discovered live from Zen. Data use: per OpenCode's Zen docs (https://opencode.ai/docs/zen/), prompts sent to free models may be retained and used for training/improvement — do not send confidential material through this provider.",
     dashboardUrl: "https://opencode.ai",
     staticHeaders: {
       // Zen answers a bare runtime User-Agent (Bun/x.y.z) more aggressively than a client
@@ -2868,11 +3174,111 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       "gpt-5.6-luna": "openai-responses",
       "gpt-5.6-sol": "openai-responses",
       "gpt-5.6-terra": "openai-responses",
+      "gpt-6-astra": "openai-responses",
+      "grok-4.5": "openai-responses",
+      "grok-4.6": "openai-responses",
+      "mai-code-1.1-flash": "openai-responses",
+      "mai-code-1-flash-picker": "openai-responses",
     },
     note: "Experimental unofficial Copilot bridge. Logs in via GitHub device flow using the public VS Code OAuth client id, then exchanges for a short-lived Copilot API token (copilot_internal). Requires an active Copilot subscription. GitHub may tighten or revoke this path; do not send confidential material you would not paste into Copilot Chat.",
   },
   // FREEZE 2026-07-10: no public OpenAI-compatible endpoint is documented. Evidence: devlog/_plan/260710_provider_hardening/003_research_aggregators.md.
   { id: "gitlab-duo", label: "GitLab Duo", baseUrl: "https://cloud.gitlab.com/ai/v1/proxy/openai/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://gitlab.com/-/user_settings/personal_access_tokens" },
+  {
+    // Official Qoder Global CLI automation surface. The canonical URL is an identity boundary;
+    // inference and model discovery are performed only by the installed vendor CLI. Authentication
+    // uses the documented PAT environment variable and never imports desktop/session credentials.
+    id: "qoder",
+    label: "Qoder (Global)",
+    adapter: "qoder",
+    baseUrl: "https://qoder.com",
+    authKind: "key",
+    apiKeyValidation: "unknown",
+    preserveCustomDestination: true,
+    dashboardUrl: "https://qoder.com/account/integrations",
+    defaultModel: "Qwen3.8-Max",
+    models: [...QODER_GLOBAL_MODELS],
+    liveModels: true,
+    reasoningEfforts: [...QODER_REASONING_EFFORTS],
+    noVisionModels: [...QODER_GLOBAL_MODELS],
+    note: "Official Qoder Global CLI using QODER_PERSONAL_ACCESS_TOKEN. Models are discovered per account with `qoder --list-models`; the documented roster is a degraded fallback. The CLI runs single-turn with tools, MCP, settings hooks, and session persistence disabled. Requires `npm install -g @qoder-ai/qodercli`.",
+  },
+  {
+    // Qoder CN is a separate credential, executable, destination, entitlement cache, and health
+    // domain. It deliberately does not reuse the OAuth/private-protocol design from #3010.
+    id: "qoder-cn",
+    label: "Qoder CN",
+    adapter: "qoder",
+    baseUrl: "https://qoder.cn",
+    authKind: "key",
+    apiKeyValidation: "unknown",
+    preserveCustomDestination: true,
+    dashboardUrl: "https://qoder.cn/account/integrations",
+    defaultModel: "Qwen3.8-Max",
+    models: [...QODER_CN_MODELS],
+    liveModels: true,
+    reasoningEfforts: [...QODER_REASONING_EFFORTS],
+    noVisionModels: [...QODER_CN_MODELS],
+    note: "Official Qoder CN CLI using QODERCN_PERSONAL_ACCESS_TOKEN. Models are discovered per account with `qodercn --list-models`; the verified roster is a degraded fallback. The CLI runs single-turn with tools, MCP, settings hooks, and session persistence disabled. Requires `npm install -g @qodercn-ai/qoderclicn`.",
+  },
+  {
+    // Official CodeBuddy Code CLI provider (Tencent Cloud), GLOBAL / `public` environment.
+    // Transport is the vendor-documented headless CLI automation surface
+    // (`codebuddy -p --output-format stream-json --tools ""`) authenticated with the official
+    // `CODEBUDDY_API_KEY` (https://www.codebuddy.ai/profile/keys). It does NOT read desktop
+    // session files, import desktop bearer tokens, impersonate the desktop client, or call the
+    // private console endpoint — the approach closed in #687 and left in draft in #2244.
+    // baseUrl is the canonical region identity: the adapter fails closed if it is overridden, so a
+    // global key is never sent to the CN environment (that is the separate `codebuddy-cn` entry).
+    // v1 runs tools-disabled so Codex keeps tool ownership; this provider is text/reasoning only
+    // until the control-protocol tool bridge lands (see docs). Free/trial/promotional/subscription
+    // credits draw from the same official API-key pool. Requires the CLI: `npm i -g @tencent-ai/codebuddy-code`.
+    // GOVERNANCE: whether routing this vendor automation surface behind a proxy for a third-party
+    // agent satisfies CodeBuddy's AUP is an open question flagged for maintainer security review.
+    id: "codebuddy",
+    label: "CodeBuddy (Global)",
+    adapter: "codebuddy",
+    baseUrl: "https://www.codebuddy.ai",
+    authKind: "key",
+    apiKeyValidation: "unknown",
+    preserveCustomDestination: true,
+    dashboardUrl: "https://www.codebuddy.ai/profile/keys",
+    defaultModel: "default-model",
+    models: CODEBUDDY_GLOBAL_MODELS,
+    liveModels: false,
+    modelContextWindows: CODEBUDDY_GLOBAL_MODEL_CONTEXT_WINDOWS,
+    modelMaxOutputTokens: CODEBUDDY_GLOBAL_MODEL_MAX_OUTPUT_TOKENS,
+    defaultMaxOutputTokens: 32_000,
+    reasoningEfforts: CODEBUDDY_REASONING_EFFORTS,
+    modelReasoningEfforts: CODEBUDDY_GLOBAL_MODEL_REASONING_EFFORTS,
+    modelDefaultReasoningEfforts: CODEBUDDY_GLOBAL_MODEL_DEFAULT_REASONING_EFFORTS,
+    note: "Official CodeBuddy Code CLI (Tencent Cloud), global/public environment. Uses the documented CODEBUDDY_API_KEY + headless CLI surface; never reads desktop sessions or private console endpoints. Region-isolated from codebuddy-cn. v1 disables CLI tools (--tools \"\") so Codex retains tool ownership: text/reasoning only for now. Requires `npm i -g @tencent-ai/codebuddy-code`. AUP/routing authorization flagged for maintainer security review.",
+  },
+  {
+    // Official CodeBuddy Code CLI provider, CHINA / `internal` environment. Identical adapter and
+    // binary as `codebuddy`; the region is fixed by the profile's CODEBUDDY_INTERNET_ENVIRONMENT
+    // and this canonical baseUrl. CN key: https://copilot.tencent.com/profile/keys. The CN model
+    // roster differs from Global (see codebuddy-models.ts) and is seeded separately (§八).
+    id: "codebuddy-cn",
+    label: "CodeBuddy (CN)",
+    adapter: "codebuddy",
+    baseUrl: "https://www.codebuddy.cn",
+    authKind: "key",
+    apiKeyValidation: "unknown",
+    preserveCustomDestination: true,
+    dashboardUrl: "https://copilot.tencent.com/profile/keys",
+    defaultModel: "default",
+    models: CODEBUDDY_CN_MODELS,
+    liveModels: false,
+    modelContextWindows: CODEBUDDY_CN_MODEL_CONTEXT_WINDOWS,
+    modelMaxOutputTokens: CODEBUDDY_CN_MODEL_MAX_OUTPUT_TOKENS,
+    defaultMaxOutputTokens: 32_000,
+    reasoningEfforts: CODEBUDDY_REASONING_EFFORTS,
+    modelReasoningEfforts: CODEBUDDY_CN_MODEL_REASONING_EFFORTS,
+    modelDefaultReasoningEfforts: CODEBUDDY_CN_MODEL_DEFAULT_REASONING_EFFORTS,
+    noVisionModels: CODEBUDDY_CN_NO_VISION_MODELS,
+    note: "Official CodeBuddy Code CLI (Tencent Cloud), China/internal environment. Uses the documented CODEBUDDY_API_KEY + headless CLI surface; never reads desktop sessions or private console endpoints. Region-isolated from codebuddy (Global); credentials are never exchanged across regions. v1 disables CLI tools (--tools \"\"): text/reasoning only for now. Requires `npm i -g @tencent-ai/codebuddy-code`. AUP/routing authorization flagged for maintainer security review.",
+  },
 ];
 
 export function providerRegistryFastWireError(

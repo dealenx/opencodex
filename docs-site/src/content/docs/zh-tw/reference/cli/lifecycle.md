@@ -52,6 +52,10 @@ ocx eject back
 
 這是範圍很廣且具破壞性的重新標記：所有含有使用者訊息且目前標記為 `opencodex` 的 thread 都會改標為 `openai`，`exec` 會正規化為 `cli`，並設定 event marker。正常的專用 provider 歷史也包含在內。請先備份狀態，而且只有在確實需要這個完整範圍時才執行。
 
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+在透過原生 Codex 恢復曾由路由提供方壓縮的工作前，修復該工作的歷史記錄。此命令依 UUID 精確選取一個工作，先儲存私有的逐位元組備份，然後只把 OpenCodeX 自有的 `ocx1:` 壓縮狀態轉換成原生 Codex 可重播的普通摘要。原生加密內容與其他工作不會變更。執行前請關閉所選工作；若 rollout 在處理期間發生變化，復原會停止且不會取代原始檔案。
+
 ### `ocx uninstall` · `ocx remove`
 
 停止服務與代理、移除服務與 Codex shim、還原原生 Codex，然後僅在所有還原步驟成功時移除 opencodex 本機設定。`remove` 是 `uninstall` 的別名。設定清理需要由全新安裝建立的擁有權中繼資料；舊版或共享目錄會被原樣保留。
@@ -121,7 +125,7 @@ ocx status --json
 
 ### `ocx ready [--json] [--wait [--timeout <seconds>]]`
 
-透過免認證的 `GET /readyz` 端點檢查同步後的就緒狀態。就緒時回傳 `200`，或 `pending` 與終端 `failed` 時回傳附帶 `Retry-After: 1` 的 `503`。其淨化的 HTTP 身分為 `{service, version, uptime, pid, port, status}`。沒有 `/readyz` 的舊代理會以 `unreachable` 方式 fail closed；`/healthz` 是分開的存活檢查，而非就緒檢查。此指令預設執行一次探測；`--wait` 輪詢直到就緒或逾時，但在觀察到終端 `failed` 狀態時立即退出。預設逾時為 45 秒；`--timeout <seconds>` 需要 `--wait`，接受 1–300 的正整數秒。CLI JSON 輸出 `{ready, status, pid, port}`，其中 `status` 為 `ready`、`pending`、`failed` 或 `unreachable`。離開碼為：就緒 0；未就緒、pending、failed、逾時或 unreachable 1；無效引數 64。
+透過免認證的 `GET /readyz` 端點檢查同步後的就緒狀態。就緒時回傳 `200`，或 `pending` 與終端 `failed` 時回傳附帶 `Retry-After: 1` 的 `503`。其淨化的 HTTP 身分為 `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`。`protocol` 是 Hub 目前的遠端協定版本，`minimumClientProtocol` 是相容的最低用戶端協定版本，`managementUrl` 是瀏覽器可見的標準管理 origin。沒有 `/readyz` 的舊代理會以 `unreachable` 方式 fail closed；`/healthz` 是分開的存活檢查，而非就緒檢查。此指令預設執行一次探測；`--wait` 輪詢直到就緒或逾時，但在觀察到終端 `failed` 狀態時立即退出。預設逾時為 45 秒；`--timeout <seconds>` 需要 `--wait`，接受 1–300 的正整數秒。CLI JSON 輸出 `{ready, status, pid, port}`，其中 `status` 為 `ready`、`pending`、`failed` 或 `unreachable`。離開碼為：就緒 0；未就緒、pending、failed、逾時或 unreachable 1；無效引數 64。
 
 ### `ocx doctor`
 
@@ -146,6 +150,10 @@ ocx status --json
 ### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 將 opencodex 作為登入管理的背景服務執行（macOS **launchd**、Linux **systemd user unit**、Windows **Task Scheduler**），在登入時自動啟動並在崩潰時自動重啟。服務執行時設定 `OCX_SERVICE=1`，使重啟不會折騰 Codex 設定。
+
+Windows 工作排程器安裝使用一般處理程序優先順序（`Priority=4`）。舊的背景優先順序（`7`，省略時排程器也預設使用 `7`）
+可能在 CPU 競爭時延遲健康檢查回應，導致處理程序仍在執行時系統匣顯示 Offline。升級後執行 `ocx service repair`，
+即可遷移該註冊優先順序並重新啟動服務；過程中可能需要核准 UAC 提示。已設為一般或高優先順序時，不會僅因優先順序而重新註冊。
 
 | 子指令 | 動作 |
 | --- | --- |
@@ -237,3 +245,7 @@ ocx update --tag preview
 ```
 
 當 [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) 將新版本發布到 npm 時，新版本即可使用。
+
+## Remote Hub 用戶端生命週期
+
+使用 `ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync` 與 `ocx connect rotate --pairing-code-stdin`。`ocx disconnect` 可離線還原本機狀態，但不會撤銷 hub 金鑰。仍連線時，`ocx connect revoke --admin-token-stdin` 會撤銷已保存的 `apiKeyId`；中斷後請使用 hub 的 **Integrations → API Keys**。秘密值只能透過 stdin 傳遞，不能放入 argv。

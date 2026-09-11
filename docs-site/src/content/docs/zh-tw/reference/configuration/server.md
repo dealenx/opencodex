@@ -89,8 +89,9 @@ stream 開啟前以 `401` 失敗。
 該 port 是必填的，且必須與 proxy port 不同。它絕不會由 OS 指派：臨時 port 會在重啟時改變，而
 已執行的 app-server 仍保留先前的 `base_url`。
 
-該 listener 只服務 `POST /v1/responses`、其 WebSocket upgrade、`POST /v1/responses/compact` 與
-`GET /v1/models`。其他一切，包括 `/api/*` 與儀表板，都會回傳 `404`。
+該 listener 只服務 `POST /v1/responses`、其 WebSocket upgrade、`POST /v1/responses/compact`、
+`POST /v1/alpha/search`（Codex 原生網頁搜尋中繼）、`GET /v1/models`，以及獨立語音 WebSocket upgrade。
+其他一切，包括 `/api/*` 與儀表板，都會回傳 `404`。
 
 :::danger[這是一個未認證的介面]
 機器上的每個 process 都可以使用此 listener。它會耗用帳號配額與付費 provider 憑證，也可能耗盡
@@ -194,3 +195,13 @@ OpenAI backend 需要 ChatGPT 登入與啟用的 ChatGPT `forward` 供應商。C
 視覺僅對發送到其供應商 `noVisionModels` 中模型的圖片啟用。OpenAI 的登入／forward 需求與搜尋相同；明確選擇的 Anthropic 在無可用憑證時 fail closed。成功的 `data:` 描述使用以 backend、模型、細節、圖片位元組與正規化訊息 context 為 key 的有界快取。命中與同回合重複不消耗限制。遠端 `https:` 圖片與失敗或空的描述不被快取。
 
 Anthropic OAuth sidecar 重用 opencodex 既有的 Claude Code OAuth 指紋。請對預期帳號與工作負載進行浸泡測試。
+
+## Remote Hub 金鑰與預設值
+
+`runtimeRole` 預設為 `standalone`。Hub 使用 `hub.managementPublicOrigin`、僅限迴路的 `hub.managementIngress`（缺省為 `enabled:false`）與正確的 `remoteGui.allowedTailscaleUsers`（缺省為空）。用戶端金鑰保存在 `service-api-token` 而不是 `config.json`；輪替期間可能暫時存在 `service-api-token.prev`。用量不會鏡像。
+
+`remoteGui.allowInsecureHttp` 是已棄用的 no-op，只為讓舊的 strict-schema 設定繼續載入而保留。請從設定移除：pairing grant 僅接受 loopback 或已驗證的 HTTPS；設為 `true` 也不會重新開放明文 HTTP pairing。
+
+## Codex 配額網路診斷
+
+主 Codex 帳戶列中的 `quotaRefresh` 描述配額查詢結果，並不代表剩餘配額或模型存取權限。讀取快取或未執行查詢時，這個欄位可能省略。查詢使用執行中代理服務的環境，而不是目前終端機的環境。未設定 `proxy` 時保留既有環境；`"auto"` 只在啟動時讀取 Windows 靜態代理設定，不會自動處理 PAC/WPAD、僅 SOCKS 的設定或執行中的變更。TUN 測試成功本身不能證明 HTTP 代理路徑正常。命令與狀態說明請見[英文網路診斷章節](/reference/configuration/server/#codex-quota-network-diagnostics)。

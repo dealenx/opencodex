@@ -1,4 +1,5 @@
 import { loadConfig } from "../config";
+import { hasPassiveAccountQuota } from "../providers/quota";
 import { closeSync, openSync, readSync } from "node:fs";
 import {
   MAX_ACCOUNT_PRIORITY,
@@ -263,6 +264,7 @@ function refreshLine(row: FamilyRows["rows"][number]): string {
   const quotaText = row.quota ? quotaParts(row.quota).join(" ") : "";
   parts.push(quotaText.length > 0 ? quotaText : "quota: unknown");
   if (row.needsReauth) parts.push("needs-reauth");
+  if (row.validationPending) parts.push("validation-pending (routing disabled; open 'ocx gui' and click Refresh quotas after recovery)");
   return parts.filter(Boolean).join(" ");
 }
 
@@ -330,10 +332,15 @@ export async function cmdRefresh(args: string[], deps: AccountDeps): Promise<num
     if (result.status === 0) return proxyUnreachable(result.transportError);
     if (result.status !== 200) return apiError(result.errorJson ?? {}, `failed to refresh ${name}`, result.status);
     if (wantsJson) console.log(JSON.stringify({ provider: name, report: result.report }, null, 2));
-    else console.log(result.report ? providerQuotaLine(name, result.report) : `no quota report available for ${name}`);
+    else if (result.report) console.log(providerQuotaLine(name, result.report));
+    // A passive provider has no probe to run, so "no report available" reads as a
+    // failure of something that was never attempted. Say what is actually true.
+    else if (hasPassiveAccountQuota(name)) {
+      console.log(`${name} reports usage only during a streaming response; there is nothing to refresh. Run a request through this provider to update it, then see \`ocx account list ${name}\`.`);
+    } else console.log(`no quota report available for ${name}`);
     return 0;
   }
-  const result = await fetchCodexRows(deps, baseUrl, true);
+  const result = await fetchCodexRows(deps, baseUrl, true, true, { refreshAction: true });
   const failed = familyFailure(result, `failed to refresh ${name}`);
   if (failed !== null) return failed;
   if (wantsJson) console.log(JSON.stringify({ accounts: result.rows }, null, 2));
@@ -347,9 +354,12 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   const action = args.shift();
   if (!name || !action) return usage();
   const classified = configAndType(deps, name);
-  if ("error" in classified || classified.type !== "codex") {
-    return usage("Error: auto-switch only applies to the openai Codex account pool");
+  // Anthropic keeps its threshold on its own pool contract; generic OAuth providers (#695)
+  // and the Codex pool are accepted here.
+  if ("error" in classified || classified.type === "api-key" || name === "anthropic") {
+    return usage("Error: auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
   }
+  const genericPool = classified.type === "oauth";
   let threshold: number | undefined;
   if (action === "on" && args.length === 0) threshold = 80;
   else if (action === "off" && args.length === 0) threshold = 0;
@@ -358,19 +368,47 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   if (threshold !== undefined && (!Number.isInteger(threshold) || threshold < 0 || threshold > 100)) {
     return usage("Error: threshold must be an integer 0-100");
   }
+  let settings: Record<string, unknown> = {};
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   if (action === "status") {
-    const response = await apiJson(deps, baseUrl, "GET", "/api/codex-auth/active");
+    const response = await apiJson(
+      deps, baseUrl, "GET",
+      genericPool ? `/api/oauth/accounts/pool?provider=${encodeURIComponent(name)}` : "/api/codex-auth/active",
+    );
     if (response.status === 0) return proxyUnreachable(response.transportError);
-    if (response.status !== 200 || typeof response.json.autoSwitchThreshold !== "number") {
+    if (response.status !== 200 || (!genericPool && typeof response.json.autoSwitchThreshold !== "number")) {
       return apiError(response.json, "failed to read auto-switch status", response.status);
     }
-    threshold = response.json.autoSwitchThreshold;
+    settings = genericPool && (!response.json || typeof response.json !== "object" || Array.isArray(response.json))
+      ? {} : response.json;
+    threshold = typeof settings.autoSwitchThreshold === "number" ? settings.autoSwitchThreshold : 0;
   } else {
-    const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/auto-switch", { threshold });
+    const response = genericPool
+      ? await apiJson(deps, baseUrl, "PUT", "/api/oauth/accounts/pool", { provider: name, autoSwitchThreshold: threshold })
+      : await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/auto-switch", { threshold });
     if (response.status === 0) return proxyUnreachable(response.transportError);
     if (response.status !== 200) return apiError(response.json, "failed to update auto-switch", response.status);
+    settings = genericPool && (!response.json || typeof response.json !== "object" || Array.isArray(response.json))
+      ? {} : response.json;
+  }
+  if (genericPool) {
+    // Generic thresholds are stored independently of the enabled override. The
+    // latter may inherit global preference and never disables reactive rotation.
+    const stored = settings.autoSwitchThreshold;
+    const storedThreshold = typeof stored === "number" && Number.isInteger(stored) && stored >= 0 && stored <= 100
+      ? stored : null;
+    const poolEnabled = typeof settings.enabled === "boolean" ? settings.enabled : null;
+    const inert = settings.inert === true ? true : null;
+    // This CLI understands only the current inert generic threshold contract.
+    const enabled = false;
+    if (wantsJson) {
+      console.log(JSON.stringify({ provider: name, autoSwitchThreshold: storedThreshold, enabled, poolEnabled, inert }, null, 2));
+    } else {
+      const value = storedThreshold === null ? "unset" : `${storedThreshold}%`;
+      console.log(`auto-switch: ${inert === true ? "inactive" : "unavailable"} (stored threshold ${value}; ${inert === true ? "not applied by this pool" : "threshold support is unknown"})`);
+    }
+    return 0;
   }
   const enabled = threshold! > 0;
   if (wantsJson) console.log(JSON.stringify({ provider: name, autoSwitchThreshold: threshold, enabled }, null, 2));
@@ -846,16 +884,17 @@ function anthropicPoolTransport(provider: string): PoolTransport {
 }
 
 /**
- * The pool-config route supports `anthropic` only and says so with a 400. Any other OAuth
- * provider is refused here with the same wording rather than spending a round-trip to learn it.
+ * Codex and Anthropic keep their own pool transports; every other OAuth provider speaks the
+ * generic pool-settings contract on the same `/api/oauth/accounts/pool` route (#695).
+ * API-key providers have no pool and are refused here without a round-trip.
  */
 function poolTransportFor(
   classified: { type: "codex" | "oauth" | "api-key" },
   name: string,
 ): PoolTransport | string {
   if (classified.type === "codex") return CODEX_POOL_TRANSPORT;
-  if (classified.type === "oauth" && name === "anthropic") return anthropicPoolTransport(name);
-  return `pool settings apply to the openai Codex pool and the anthropic pool, not "${name}"`;
+  if (classified.type === "oauth") return anthropicPoolTransport(name);
+  return `pool settings apply to OAuth account pools, not the API-key provider "${name}"`;
 }
 
 /**

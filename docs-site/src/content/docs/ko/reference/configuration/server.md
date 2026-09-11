@@ -161,3 +161,13 @@ OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider
 지원되는 수준은 업스트림 제공자의 역량과 선택한 모델이 공개한 추론 사다리에 따라 제한됩니다. Vision은 provider의 `noVisionModels`에 속한 모델로 보낸 이미지에만 활성화됩니다. OpenAI는 검색과 같은 로그인/forward 요건을 갖고 있으며, 명시적으로 선택한 Anthropic은 사용할 수 있는 자격 증명이 없으면 닫힌 상태로 실패합니다. 성공한 `data:` 설명은 backend, model, detail, image bytes, 그리고 정규화된 메시지 컨텍스트를 키로 하는 bounded cache를 사용합니다. OpenAI 키에는 reasoning effort도 포함됩니다(Anthropic 키에는 없습니다). 히트와 같은 턴의 중복은 한도를 소모하지 않습니다. 원격 `https:` 이미지와 실패했거나 비어 있는 설명은 캐시하지 않습니다.
 
 Anthropic OAuth 사이드카는 opencodex의 기존 Claude Code OAuth fingerprint를 재사용합니다. 의도한 계정과 워크로드로 소크 테스트를 수행합니다.
+
+## Remote Hub 키와 기본값
+
+`runtimeRole` 기본값은 `standalone`입니다. 허브는 `hub.managementPublicOrigin`, 로컬에만 열리는 `hub.managementIngress`(없으면 `enabled:false`), 정확한 `remoteGui.allowedTailscaleUsers`(없으면 빈 목록)를 사용합니다. 클라이언트 데이터 키는 `config.json`이 아니라 `service-api-token`에 저장되며 교체 중에는 `service-api-token.prev`가 잠시 생길 수 있습니다. 사용량 기록은 서로 복제하지 않습니다.
+
+`remoteGui.allowInsecureHttp`는 이전 strict-schema 설정을 계속 읽기 위해서만 남겨 둔 폐기된 no-op입니다. 설정에서 제거하세요. 페어링 grant는 loopback 또는 인증된 HTTPS에서만 허용되며, 이 값을 `true`로 설정해도 평문 HTTP 페어링은 다시 활성화되지 않습니다.
+
+## Codex 할당량 네트워크 진단
+
+메인 Codex 계정 행의 `quotaRefresh`는 할당량 조회 결과를 분류하는 진단값입니다. 남은 할당량이나 모델 접근 권한을 뜻하지 않으며, 캐시를 쓰거나 조회하지 않았다면 생략될 수 있습니다. 요청은 명령을 입력한 터미널이 아니라 실행 중인 프록시 서비스의 환경을 따릅니다. `proxy`를 지정하지 않으면 기존 환경을 유지하고, `"auto"`는 시작할 때 Windows의 정적 프록시 설정만 읽습니다. PAC/WPAD, SOCKS 전용 설정과 실행 중 변경은 자동으로 반영하지 않습니다. TUN에서 성공했다고 HTTP 프록시 경로도 정상이라는 뜻은 아닙니다. 명령과 상태값은 [네트워크 진단(영문)](/reference/configuration/server/#codex-quota-network-diagnostics)에서 확인하세요.

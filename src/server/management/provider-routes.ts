@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import type { CatalogModel } from "../../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
 import { clearGatherRoutedModelsInflight } from "../../codex/catalog/provider-fetch";
@@ -9,7 +10,9 @@ import {
   codexAutoStartEnabled,
   hasOwnProvider,
   isValidProviderName,
+  modelDisplayNamesConfigError,
   multiAgentGuidanceEnabled,
+  mutatePersistedConfig,
   nonBlankStringArrayConfigError,
   normalizeNonBlankStringArray,
   providerBaseUrlConfigError,
@@ -18,6 +21,7 @@ import {
   readConfigAdmissionSnapshot,
   saveConfigPreservingClaudeCode,
   upstreamHttpVersionConfigError,
+  validateConfigCandidate,
   withConfigMutationLockSync,
 } from "../../config";
 import {
@@ -29,21 +33,28 @@ import {
   submitManualLoginCode,
   upsertOAuthProvider,
 } from "../../oauth";
+import { captureConfigTopLevelRollback } from "../../config/rebase-provenance";
+import { mergeModelPinnedEfforts, modelPinnedEffortsConfigError, pinnedReasoningEffortConfigError } from "../../config/provider-validation";
 import { replaceProviderAccountSet } from "../../oauth/store";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { ProviderOutboundPolicyError, providerOutboundGet, providerOutboundPost, providerRedirectError } from "../../lib/provider-outbound";
 import { fetchCursorUsableModels } from "../../adapters/cursor/live-models";
+import { fetchQoderModels } from "../../adapters/qoder/live-models";
+import { resolveQoderProfile } from "../../adapters/qoder/profiles";
 import { parseAntigravityAvailableModels } from "../../providers/antigravity-models";
 import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/key-providers";
 import { deriveProviderPresets, providerConfigSeed } from "../../providers/derive";
+import { initializeProviderModelSelection } from "../../providers/initial-model-selection";
 import { effectiveGoogleMode, providerCodexAccountMode, providerMatchesRegistryTransport } from "../../providers/registry";
 import {
   extractModelEnvelopeRows,
   extractProviderModelItems,
+  isRegistryModelDiscoveryUrl,
   readBoundedDiscoveryJson,
   resolveProviderModelDiscovery,
 } from "../../providers/model-discovery";
+import { extractGoogleAiStudioModelItems } from "../../providers/google-ai-studio-model-discovery";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
 import { clearKeyCooldowns } from "../../providers/key-failover";
@@ -54,7 +65,7 @@ import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { clearModelCache, getProviderDiscoveryStatus } from "../../codex/model-cache";
 import { getCodexModelEntitlementStatus } from "../../codex/model-entitlements";
-import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
+import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, selectedProviderContextCaps, forgetProviderContextCap, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
 import { modelAutoCompactTokenLimitsConfigError } from "../../providers/auto-compact-budget";
 import { resolveCodexHomeDir } from "../../codex/home";
 import { readUsageEntries } from "../../usage/log";
@@ -76,7 +87,17 @@ import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import type { PersistedUsageAttempt } from "../../usage/log";
-import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "../auth-cors";
+import {
+  isAllowedRequestOrigin,
+  jsonResponse,
+  parseProviderEditorConfigDTO,
+  providerEditorConfigDTO,
+  providerManagementConfigError,
+  publicProviderBaseUrl,
+  safeConfigDTO,
+  type ProviderEditorConfigDTO,
+  type ProviderEditorProviderDTO,
+} from "../auth-cors";
 import { providerServiceTierConfigError } from "./provider-capability-config";
 import { providerEmptyToolOutputConfigError } from "../../config/provider-validation";
 import { applySystemEnvToggle } from "../system-env";
@@ -85,10 +106,13 @@ import {
   LOCAL_PROVIDER_RELOAD_PATH,
 } from "../../lib/local-provider-reload-contract";
 import { refreshUserCostOverlays } from "../../usage/user-cost-overlays";
+import { redactSecretString } from "../../lib/redact";
 import {
   XAI_RESPONSES_OPT_IN_MODELS,
+  XAI_RESPONSES_DEFAULT_VERSION,
   xaiResponsesOptInState,
 } from "../../providers/xai-responses-opt-in";
+import { dropProviderCustomModels } from "../../providers/provider-id-rewrite";
 
 import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
@@ -104,6 +128,205 @@ type ProviderPatchApplication =
       enablingOpenAi: boolean;
       headersTouched: boolean;
     };
+
+const PROVIDER_ALIAS_OVERLAY_FIELDS = ["alias", "modelAliases", "defaultAliases"] as const;
+type ProviderAliasOverlayField = typeof PROVIDER_ALIAS_OVERLAY_FIELDS[number];
+
+/**
+ * Alias overlays are owned by the dedicated alias management routes. A full provider POST
+ * may round-trip an already-persisted value, but it must not create, clear, or change one.
+ * PATCH is field-masked and rejects these keys outright below.
+ */
+function providerAliasOverlayOwnershipError(
+  submitted: Record<string, unknown>,
+  existing: OcxProviderConfig | undefined,
+): string | null {
+  for (const field of PROVIDER_ALIAS_OVERLAY_FIELDS) {
+    if (!Object.hasOwn(submitted, field)) continue;
+    if (!existing || !Object.hasOwn(existing, field)) {
+      return `${field} is managed by the dedicated alias API`;
+    }
+    const incoming = submitted[field];
+    const persisted = existing[field];
+    if (field === "modelAliases") {
+      if (!isPlainRecord(incoming) || !isPlainRecord(persisted)) {
+        return "modelAliases is managed by the dedicated alias API";
+      }
+      const incomingEntries = Object.entries(incoming);
+      const persistedEntries = Object.entries(persisted);
+      if (
+        incomingEntries.length !== persistedEntries.length
+        || incomingEntries.some(([model, alias]) => typeof alias !== "string" || persisted[model] !== alias)
+      ) {
+        return "modelAliases is managed by the dedicated alias API";
+      }
+      continue;
+    }
+    if (incoming !== persisted) return `${field} is managed by the dedicated alias API`;
+  }
+  return null;
+}
+
+/** Remove only alias overlays whose ownership has already been established by the caller. */
+function providerTransportValidationCandidate(provider: Record<string, unknown>): Record<string, unknown> {
+  const candidate = { ...provider };
+  for (const field of PROVIDER_ALIAS_OVERLAY_FIELDS) delete candidate[field];
+  return candidate;
+}
+
+/** Preserve the authoritative alias values from the stored provider during a full edit. */
+function restorePersistedAliasOverlays(target: OcxProviderConfig, existing: OcxProviderConfig | undefined): void {
+  for (const field of PROVIDER_ALIAS_OVERLAY_FIELDS) {
+    delete (target as Record<ProviderAliasOverlayField, unknown>)[field];
+    if (!existing || !Object.hasOwn(existing, field)) continue;
+    const value = existing[field];
+    (target as Record<ProviderAliasOverlayField, unknown>)[field] = field === "modelAliases"
+      ? structuredClone(value)
+      : value;
+  }
+}
+
+type ProviderEditorCandidateResult =
+  | { ok: true; config: OcxConfig; removedProviders: string[] }
+  | { ok: false; status: 400 | 409; error: string; code: string };
+
+type ProviderEditorMutationValue = ProviderEditorCandidateResult;
+
+function mergeProviderEditorRow(
+  persisted: OcxProviderConfig | undefined,
+  baseline: ProviderEditorProviderDTO | undefined,
+  next: ProviderEditorProviderDTO,
+): OcxProviderConfig {
+  const merged = structuredClone(persisted ?? {}) as Record<string, unknown>;
+  const fields = new Set([...Object.keys(baseline ?? {}), ...Object.keys(next)]);
+  for (const field of fields) {
+    const baselineHasField = baseline !== undefined && Object.hasOwn(baseline, field);
+    const nextHasField = Object.hasOwn(next, field);
+    if (
+      baselineHasField === nextHasField
+      && (!baselineHasField || isDeepStrictEqual(baseline[field], next[field]))
+    ) {
+      continue;
+    }
+    if (nextHasField) merged[field] = structuredClone(next[field]);
+    else delete merged[field];
+  }
+  return merged as unknown as OcxProviderConfig;
+}
+
+/** Build and validate a complete candidate without mutating the caller's snapshot. */
+function providerEditorCandidate(
+  persisted: OcxConfig,
+  baseline: ProviderEditorConfigDTO,
+  next: ProviderEditorConfigDTO,
+): ProviderEditorCandidateResult {
+  const candidate = structuredClone(persisted);
+  const removedProviders = Object.keys(persisted.providers)
+    .filter(name => !Object.hasOwn(next.providers, name));
+
+  for (const name of removedProviders) {
+    const dependentCombos = Object.entries(persisted.combos ?? {})
+      .filter(([, combo]) => combo.targets.some(target => target.provider === name))
+      .map(([id]) => id)
+      .sort((a, b) => a.localeCompare(b));
+    if (dependentCombos.length > 0) {
+      return {
+        ok: false,
+        status: 409,
+        error: `cannot delete provider ${JSON.stringify(redactSecretString(name))} while combos depend on it`,
+        code: "provider_has_dependent_combos",
+      };
+    }
+  }
+
+  const providers: Record<string, OcxProviderConfig> = Object.create(null);
+  for (const [name, publicProvider] of Object.entries(next.providers)) {
+    if (!isValidProviderName(name)) {
+      return {
+        ok: false,
+        status: 400,
+        error: "provider name must use letters, numbers, dot, underscore, or hyphen and cannot be a reserved object key",
+        code: "invalid_provider_name",
+      };
+    }
+    const namespaceCollision = codexAccountNamespaceProviderCollisionError(candidate.codexAccountNamespaces, name);
+    if (namespaceCollision) return { ok: false, status: 409, error: namespaceCollision, code: "provider_namespace_conflict" };
+    const merged = mergeProviderEditorRow(persisted.providers[name], baseline.providers[name], publicProvider);
+    const transportCandidate = providerTransportValidationCandidate(merged as unknown as Record<string, unknown>);
+    const providerError = providerManagementConfigError(name, transportCandidate)
+      ?? providerEmptyToolOutputConfigError(name, transportCandidate)
+      ?? providerServiceTierConfigError(name, transportCandidate);
+    if (providerError) return { ok: false, status: 400, error: providerError, code: "invalid_provider" };
+    providers[name] = merged;
+  }
+
+  const defaultProvider = next.defaultProvider.trim();
+  const selectedDefault = providers[defaultProvider];
+  if (!selectedDefault) {
+    return { ok: false, status: 400, error: "defaultProvider must name a configured provider", code: "invalid_default_provider" };
+  }
+  if (selectedDefault.disabled === true) {
+    return { ok: false, status: 400, error: "defaultProvider cannot be disabled", code: "default_provider_disabled" };
+  }
+
+  candidate.defaultProvider = defaultProvider;
+  candidate.providers = providers;
+  for (const name of removedProviders) {
+    dropProviderCustomModels(candidate, name);
+    forgetProviderContextCap(candidate, name);
+  }
+  const validated = validateConfigCandidate(candidate);
+  if (!validated.ok) {
+    return { ok: false, status: 400, error: validated.error, code: "invalid_provider_editor_config" };
+  }
+  for (const [name, provider] of Object.entries(candidate.providers)) {
+    if (provider.modelPinnedReasoningEfforts !== undefined) {
+      provider.modelPinnedReasoningEfforts = validated.config.providers[name]!.modelPinnedReasoningEfforts;
+    }
+  }
+  return { ok: true, config: candidate, removedProviders };
+}
+
+function adoptProviderEditorCandidate(live: OcxConfig, persisted: OcxConfig): void {
+  live.defaultProvider = persisted.defaultProvider;
+  for (const name of Object.keys(live.providers)) {
+    if (!Object.hasOwn(persisted.providers, name)) delete live.providers[name];
+  }
+  for (const [name, provider] of Object.entries(persisted.providers)) {
+    live.providers[name] = structuredClone(provider);
+  }
+  if (persisted.customModels === undefined) delete live.customModels;
+  else live.customModels = structuredClone(persisted.customModels);
+  if (persisted.providerContextCaps === undefined) delete live.providerContextCaps;
+  else live.providerContextCaps = structuredClone(persisted.providerContextCaps);
+  if (persisted.providerContextCapValues === undefined) delete live.providerContextCapValues;
+  else live.providerContextCapValues = structuredClone(persisted.providerContextCapValues);
+  if (persisted.disabledModels === undefined) delete live.disabledModels;
+  else live.disabledModels = [...persisted.disabledModels];
+  if (persisted.modelDiscovery === undefined) delete live.modelDiscovery;
+  else live.modelDiscovery = structuredClone(persisted.modelDiscovery);
+}
+
+/** Share pin merge/clear semantics between POST and the PATCH mask. */
+function applyProviderPinFields(
+  next: OcxProviderConfig,
+  patch: Record<string, unknown>,
+  current: OcxProviderConfig | undefined,
+): string | null {
+  const scalarError = pinnedReasoningEffortConfigError(patch.pinnedReasoningEffort, true);
+  const mapError = modelPinnedEffortsConfigError(patch.modelPinnedReasoningEfforts, "modelPinnedReasoningEfforts", true);
+  if (scalarError || mapError) return scalarError ?? mapError;
+  const scalar = Object.hasOwn(patch, "pinnedReasoningEffort")
+    ? patch.pinnedReasoningEffort : current?.pinnedReasoningEffort;
+  const map = Object.hasOwn(patch, "modelPinnedReasoningEfforts")
+    ? mergeModelPinnedEfforts(current?.modelPinnedReasoningEfforts, patch.modelPinnedReasoningEfforts)
+    : current?.modelPinnedReasoningEfforts;
+  if (scalar === undefined || scalar === null || scalar === "") delete next.pinnedReasoningEffort;
+  else next.pinnedReasoningEffort = scalar as string;
+  if (map === undefined) delete next.modelPinnedReasoningEfforts;
+  else next.modelPinnedReasoningEfforts = { ...map };
+  return null;
+}
 
 /**
  * Apply the recognized PATCH field mask onto a provider copy. The caller runs this once
@@ -208,10 +431,11 @@ function applyProviderPatchFields(
     const modelAdapters = { ...(next.modelAdapters ?? {}) };
     for (const model of XAI_RESPONSES_OPT_IN_MODELS) {
       if (rawBody.xaiResponsesOptIn) modelAdapters[model] = "openai-responses";
-      else delete modelAdapters[model];
+      else modelAdapters[model] = "openai-chat";
     }
     if (Object.keys(modelAdapters).length > 0) next.modelAdapters = modelAdapters;
     else delete next.modelAdapters;
+    next.xaiResponsesDefaultVersion = Math.max(next.xaiResponsesDefaultVersion ?? 0, XAI_RESPONSES_DEFAULT_VERSION);
     touched = true;
   }
   if (Object.hasOwn(rawBody, "requestPacing")) {
@@ -239,6 +463,11 @@ function applyProviderPatchFields(
       // explicit because the incoming value is an unknown JSON scalar.
       next.upstreamHttpVersion = value as OcxProviderConfig["upstreamHttpVersion"];
     }
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "upstreamWebsocket")) {
+    if (typeof rawBody.upstreamWebsocket !== "boolean") return { error: "upstreamWebsocket must be a boolean" };
+    next.upstreamWebsocket = rawBody.upstreamWebsocket;
     touched = true;
   }
   // The Models page edits the catalog hints in place; keep them on the existing
@@ -278,6 +507,11 @@ function applyProviderPatchFields(
       if (Object.keys(windows).length > 0) next.modelContextWindows = windows;
       else delete next.modelContextWindows;
     }
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "pinnedReasoningEffort") || Object.hasOwn(rawBody, "modelPinnedReasoningEfforts")) {
+    const error = applyProviderPinFields(next, rawBody, provider);
+    if (error) return { error };
     touched = true;
   }
   if (Object.hasOwn(rawBody, "modelAutoCompactTokenLimits")) {
@@ -336,6 +570,32 @@ function applyProviderPatchFields(
       const models = normalizeNonBlankStringArray(value as string[]);
       if (models.length > 0) next.noStructuredOutputModels = models;
       else delete next.noStructuredOutputModels;
+    }
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "retainModels")) {
+    const value = rawBody.retainModels;
+    if (value === null) {
+      delete next.retainModels;
+    } else {
+      const error = nonBlankStringArrayConfigError(value, "retainModels");
+      if (error) return { error };
+      const models = normalizeNonBlankStringArray(value as string[]);
+      if (models.length > 0) next.retainModels = models;
+      else delete next.retainModels;
+    }
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "omitReasoningEffortWithToolsModels")) {
+    const value = rawBody.omitReasoningEffortWithToolsModels;
+    if (value === null) {
+      delete next.omitReasoningEffortWithToolsModels;
+    } else {
+      const error = nonBlankStringArrayConfigError(value, "omitReasoningEffortWithToolsModels");
+      if (error) return { error };
+      const models = normalizeNonBlankStringArray(value as string[]);
+      if (models.length > 0) next.omitReasoningEffortWithToolsModels = models;
+      else delete next.omitReasoningEffortWithToolsModels;
     }
     touched = true;
   }
@@ -465,10 +725,15 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       models: p.models ?? [],
       contextWindow: p.contextWindow,
       modelContextWindows: p.modelContextWindows,
+      pinnedReasoningEffort: p.pinnedReasoningEffort,
+      modelPinnedReasoningEfforts: p.modelPinnedReasoningEfforts,
       modelAutoCompactTokenLimits: p.modelAutoCompactTokenLimits,
       modelSupportsServiceTier: p.modelSupportsServiceTier,
       noStructuredOutputModels: p.noStructuredOutputModels,
+      retainModels: p.retainModels,
+      omitReasoningEffortWithToolsModels: p.omitReasoningEffortWithToolsModels,
       upstreamHttpVersion: p.upstreamHttpVersion,
+      upstreamWebsocket: p.upstreamWebsocket === true,
       authMode: p.authMode,
       apiKeyTransport: p.apiKeyTransport,
       disabled: p.disabled === true,
@@ -501,7 +766,10 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       return jsonResponse({ error: "provider reload target unavailable" }, 404);
     }
     const provider = diskConfig.providers[name]!;
-    const providerError = providerManagementConfigError(name, provider)
+    const providerError = providerManagementConfigError(
+      name,
+      providerTransportValidationCandidate(provider as unknown as Record<string, unknown>),
+    )
       ?? providerEmptyToolOutputConfigError(name, provider);
     if (providerError) return jsonResponse({ error: "provider reload target invalid" }, 409);
     const namespaceCollision = codexAccountNamespaceProviderCollisionError(
@@ -554,6 +822,105 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     return jsonResponse({ success: true, name, catalogRefresh });
   }
 
+  if (url.pathname === "/api/providers" && req.method === "PUT") {
+    let rawBody: unknown;
+    try {
+      rawBody = await readManagementJsonBody(req);
+    } catch (error) {
+      rethrowManagementBodyTooLarge(error);
+      return jsonResponse({ error: "invalid JSON body" }, 400);
+    }
+    if (!isPlainRecord(rawBody)) {
+      return jsonResponse({ error: "provider batch body must be a plain object", code: "invalid_provider_editor_body" }, 400);
+    }
+    const bodyKeys = Object.keys(rawBody);
+    if (bodyKeys.length !== 2 || !Object.hasOwn(rawBody, "baseline") || !Object.hasOwn(rawBody, "next")) {
+      return jsonResponse({ error: "provider batch body must contain only baseline and next", code: "invalid_provider_editor_body" }, 400);
+    }
+    const baselineResult = parseProviderEditorConfigDTO(rawBody.baseline);
+    if (!baselineResult.ok) return jsonResponse({ error: baselineResult.error, code: baselineResult.code }, 400);
+    const nextResult = parseProviderEditorConfigDTO(rawBody.next);
+    if (!nextResult.ok) return jsonResponse({ error: nextResult.error, code: nextResult.code }, 400);
+
+    const observed = readConfigAdmissionSnapshot();
+    if (observed.kind !== "read" || observed.diagnostics.source !== "file" || observed.diagnostics.error !== null) {
+      return jsonResponse({ error: "provider config is unavailable", code: "provider_config_unavailable" }, 409);
+    }
+    if (!isDeepStrictEqual(providerEditorConfigDTO(observed.diagnostics.config), baselineResult.value)) {
+      return jsonResponse({ error: "provider editor baseline is stale", code: "stale_provider_editor_baseline" }, 409);
+    }
+    const preview = providerEditorCandidate(observed.diagnostics.config, baselineResult.value, nextResult.value);
+    if (!preview.ok) return jsonResponse({ error: preview.error, code: preview.code }, preview.status);
+
+    // DNS/SSRF validation happens before the persistence callback. The callback repeats every
+    // synchronous check against a fresh snapshot and rejects a changed baseline, so this awaited
+    // phase can never authorize a stale provider set.
+    for (const [name, provider] of Object.entries(preview.config.providers)) {
+      const allowBenchmarkAddresses = name === "openai" && isCanonicalOpenAiForwardProvider(provider);
+      const resolvedError = await providerDestinationResolvedError(name, provider, { allowBenchmarkAddresses });
+      if (resolvedError) return jsonResponse({ error: resolvedError, code: "invalid_provider_destination" }, 400);
+    }
+
+    const outcome = mutatePersistedConfig<ProviderEditorMutationValue>(persisted => {
+      if (!isDeepStrictEqual(providerEditorConfigDTO(persisted), baselineResult.value)) {
+        return {
+          changed: false,
+          value: {
+            ok: false,
+            status: 409,
+            error: "provider editor baseline is stale",
+            code: "stale_provider_editor_baseline",
+          },
+        };
+      }
+      const candidate = providerEditorCandidate(persisted, baselineResult.value, nextResult.value);
+      if (!candidate.ok) return { changed: false, value: candidate };
+      const changed = !isDeepStrictEqual(providerEditorConfigDTO(persisted), nextResult.value);
+      if (!changed) return { changed: false, value: candidate };
+
+      for (const [name, provider] of Object.entries(candidate.config.providers)) {
+        if (!Object.hasOwn(persisted.providers, name)) {
+          initializeProviderModelSelection(name, provider, undefined, candidate.config);
+        }
+      }
+      persisted.defaultProvider = candidate.config.defaultProvider;
+      persisted.providers = structuredClone(candidate.config.providers);
+      persisted.disabledModels = candidate.config.disabledModels;
+      persisted.modelDiscovery = candidate.config.modelDiscovery;
+      for (const name of candidate.removedProviders) {
+        dropProviderCustomModels(persisted, name);
+        forgetProviderContextCap(persisted, name);
+      }
+      return {
+        changed: true,
+        value: {
+          ok: true,
+          config: structuredClone(persisted),
+          removedProviders: candidate.removedProviders,
+        },
+      };
+    });
+    if (outcome.status === "unavailable") {
+      const code = outcome.reason === "conflict" ? "provider_config_conflict" : "provider_config_unavailable";
+      return jsonResponse({ error: "provider config changed before it could be saved", code }, 409);
+    }
+    if (!outcome.value.ok) {
+      return jsonResponse({ error: outcome.value.error, code: outcome.value.code }, outcome.value.status);
+    }
+
+    adoptProviderEditorCandidate(config, outcome.value.config);
+    reconcileLiveStateStores();
+    refreshUserCostOverlays(outcome.value.config);
+    clearGatherRoutedModelsInflight();
+    (deps.clearProviderQuotaCache ?? clearProviderQuotaCache)();
+    clearAccountQuotaCache();
+    clearKeyCooldowns();
+    clearModelCache();
+    (deps.clearThreadAccountMap ?? clearThreadAccountMap)();
+    const catalogRefresh = await convergeCodexCatalog();
+    return jsonResponse({ success: true, catalogRefresh });
+  }
+
   // Add (or overwrite) a single provider. Merges into the live in-memory config and
   // persists — existing providers' real keys are never round-tripped (unlike PUT /api/config,
   // which would re-save the masked keys from GET). Live routing picks it up immediately.
@@ -561,12 +928,23 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     let body: { name?: unknown; provider?: unknown; setDefault?: boolean };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     const name = typeof body.name === "string" ? body.name.trim() : "";
-    const providerError = providerManagementConfigError(name, body.provider)
-      ?? providerEmptyToolOutputConfigError(name, body.provider);
+    if (!isPlainRecord(body.provider)) return jsonResponse({ error: "provider must be a plain object" }, 400);
+    const existing = config.providers[name];
+    const aliasOwnershipError = providerAliasOverlayOwnershipError(body.provider, existing);
+    if (aliasOwnershipError) return jsonResponse({ error: aliasOwnershipError }, 400);
+    const transportCandidate = providerTransportValidationCandidate(body.provider);
+    const pinError = applyProviderPinFields(transportCandidate as unknown as OcxProviderConfig, body.provider, existing);
+    if (pinError) return jsonResponse({ error: pinError }, 400);
+    const providerError = providerManagementConfigError(name, transportCandidate)
+      ?? providerEmptyToolOutputConfigError(name, transportCandidate);
     if (providerError) return jsonResponse({ error: providerError }, 400);
-    const serviceTierError = providerServiceTierConfigError(name, body.provider);
+    const rawProvider = body.provider as Record<string, unknown>;
+    if (rawProvider.upstreamWebsocket !== undefined && typeof rawProvider.upstreamWebsocket !== "boolean") {
+      return jsonResponse({ error: "upstreamWebsocket must be a boolean" }, 400);
+    }
+    const serviceTierError = providerServiceTierConfigError(name, transportCandidate);
     if (serviceTierError) return jsonResponse({ error: serviceTierError }, 400);
-    const prov = body.provider ? stripCodexRuntimeProviderFields(body.provider as OcxProviderConfig) : undefined;
+    const prov = stripCodexRuntimeProviderFields(transportCandidate as unknown as OcxProviderConfig);
     // PATCH already clears on null; POST persisted the body as submitted, so a `null` here
     // reached disk and the next loadConfig() refused it. Canonicalize to absent, which is what
     // "clear" means everywhere else.
@@ -574,6 +952,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     if (!name || !prov?.adapter || !prov?.baseUrl) {
       return jsonResponse({ error: "name, provider.adapter and provider.baseUrl are required" }, 400);
     }
+    const displayNamesError = modelDisplayNamesConfigError(prov.modelDisplayNames);
+    if (displayNamesError) return jsonResponse({ error: displayNamesError }, 400);
     if (!isValidProviderName(name)) {
       return jsonResponse({ error: "provider name must use letters, numbers, dot, underscore, or hyphen and cannot be a reserved object key" }, 400);
     }
@@ -603,7 +983,9 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const submittedContextWindow = Object.hasOwn(prov, "contextWindow");
     const submittedModelContextWindows = Object.hasOwn(prov, "modelContextWindows");
     const submittedModelAutoCompactTokenLimits = Object.hasOwn(prov, "modelAutoCompactTokenLimits");
+    const submittedModelDisplayNames = Object.hasOwn(prov, "modelDisplayNames");
     const submittedRequestPacing = Object.hasOwn(prov, "requestPacing");
+    const submittedUpstreamWebsocket = Object.hasOwn(prov, "upstreamWebsocket");
     // Same trap, one more field: DeepSeek carries a registry default of `true` for
     // annotateEmptyToolOutputs, so enrichment cannot distinguish "the client omitted it"
     // from "the registry supplied it" either. Without this sample, an unrelated edit that
@@ -630,7 +1012,9 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     // has no member for either field, so the add/edit form structurally cannot send them:
     // absence in the request means "not carried", never "the user deleted it". Deletion goes
     // through PATCH with an explicit null (#1409).
-    const existing = config.providers[name];
+    if (!submittedModelDisplayNames && existing?.modelDisplayNames) {
+      prov.modelDisplayNames = { ...existing.modelDisplayNames };
+    }
     if (!submittedRequestPacing && existing?.requestPacing) {
       prov.requestPacing = structuredClone(existing.requestPacing);
     }
@@ -641,6 +1025,12 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     // an explicit `false` must survive, and `false` is falsy.
     if (!submittedAnnotateEmptyToolOutputs && existing?.annotateEmptyToolOutputs !== undefined) {
       prov.annotateEmptyToolOutputs = existing.annotateEmptyToolOutputs;
+    }
+    // The provider add/edit form may omit this transport option. Preserve the stored value
+    // during a full overwrite; PATCH remains the explicit mutation path, and `!== undefined`
+    // keeps an operator's explicit false from being treated as absent.
+    if (!submittedUpstreamWebsocket && existing?.upstreamWebsocket !== undefined) {
+      prov.upstreamWebsocket = existing.upstreamWebsocket;
     }
     if (existing?.modelContextWindows) {
       // When the client did send a map, its keys win and the user's other keys survive. When
@@ -656,9 +1046,64 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         ? { ...existing.modelAutoCompactTokenLimits, ...(prov.modelAutoCompactTokenLimits ?? {}) }
         : { ...existing.modelAutoCompactTokenLimits };
     }
-    config.providers[name] = stripRegistryOnlyStaticHeaders(name, prov);
-    if (body.setDefault === true) config.defaultProvider = name;
-    save(config);
+    // DNS validation above awaits. Re-read the live row so a dedicated alias write that
+    // completed during that wait remains authoritative instead of being overwritten by the
+    // older ownership snapshot used to admit this POST.
+    restorePersistedAliasOverlays(prov, config.providers[name]);
+    // The add/edit form omits wire choices. Read after DNS so a concurrent switch
+    // remains authoritative, including the marker that protects it on the next boot.
+    if (name === "xai") {
+      const latest = config.providers[name];
+      if (!Object.hasOwn(body.provider, "modelAdapters") && latest?.modelAdapters) {
+        prov.modelAdapters = { ...latest.modelAdapters };
+      }
+      if (latest?.xaiResponsesDefaultVersion !== undefined) {
+        prov.xaiResponsesDefaultVersion = latest.xaiResponsesDefaultVersion;
+      }
+    }
+    // Reapply pins to the latest live row after DNS/import awaits, then validate the
+    // complete draft before adopting any provider/default state.
+    const latest = config.providers[name];
+    const latestPinError = applyProviderPinFields(prov, body.provider, latest);
+    if (latestPinError) return jsonResponse({ error: latestPinError }, 400);
+    const pinsOwned = Object.hasOwn(body.provider, "pinnedReasoningEffort")
+      || Object.hasOwn(body.provider, "modelPinnedReasoningEfforts")
+      || latest?.pinnedReasoningEffort !== undefined || latest?.modelPinnedReasoningEfforts !== undefined;
+    // New registration also edits discovery/disabled-model state; stage those
+    // side effects with the pin draft instead of mutating live state before validation.
+    const registrationDraft = pinsOwned && !latest ? {
+      ...config,
+      ...(config.modelDiscovery === undefined ? {} : { modelDiscovery: structuredClone(config.modelDiscovery) }),
+    } : undefined;
+    initializeProviderModelSelection(name, prov, latest, registrationDraft ?? config);
+    const candidate = stripRegistryOnlyStaticHeaders(name, prov);
+    if (pinsOwned) {
+      const draft = { ...(registrationDraft ?? config), providers: { ...config.providers, [name]: candidate },
+        ...(body.setDefault === true ? { defaultProvider: name } : {}) };
+      const validation = validateConfigCandidate(draft);
+      if (!validation.ok) return jsonResponse({ error: validation.error }, 400);
+    }
+    const previous = Object.getOwnPropertyDescriptor(config.providers, name);
+    const rollback = pinsOwned ? captureConfigTopLevelRollback(config, ["defaultProvider", "modelDiscovery", "disabledModels"]) : undefined;
+    try {
+      if (registrationDraft) {
+        for (const key of ["modelDiscovery", "disabledModels"] as const) {
+          if (Object.hasOwn(registrationDraft, key)) Object.defineProperty(config, key, {
+            value: registrationDraft[key], writable: true, enumerable: true, configurable: true,
+          });
+        }
+      }
+      config.providers[name] = candidate;
+      if (body.setDefault === true) config.defaultProvider = name;
+      (deps.saveConfigPreservingClaudeCode ?? save)(config);
+    } catch (error) {
+      if (rollback) {
+        if (previous) Object.defineProperty(config.providers, name, previous);
+        else delete config.providers[name];
+        rollback();
+      }
+      throw error;
+    }
     reconcileLiveStateStores();
     if (prov.apiKey && prov.apiKeyPool) {
       const { addProviderApiKey } = await import("../../providers/api-keys");
@@ -677,6 +1122,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     try { rawBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (!isPlainRecord(rawBody)) return jsonResponse({ error: "provider patch body must be a plain object" }, 400);
     const keys = Object.keys(rawBody);
+    const aliasField = PROVIDER_ALIAS_OVERLAY_FIELDS.find(field => Object.hasOwn(rawBody, field));
+    if (aliasField) return jsonResponse({ error: `${aliasField} is managed by the dedicated alias API` }, 400);
     const hasMode = Object.hasOwn(rawBody, "codexAccountMode");
     const hasSetDefault = Object.hasOwn(rawBody, "setDefault");
     const canonicalBudgetOnly = name === "openai"
@@ -746,13 +1193,22 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     if (applied.editorTouched && !pacingOnly) {
       const providerError = canonicalBudgetOnly
         ? canonicalOpenAiBudgetPatchError(next, rawBody, keys, config)
-        : providerManagementConfigError(name, next)
+        : providerManagementConfigError(
+            name,
+            providerTransportValidationCandidate(next as unknown as Record<string, unknown>),
+          )
           ?? providerEmptyToolOutputConfigError(name, next);
       if (providerError) return jsonResponse({ error: providerError }, 400);
       if (!canonicalBudgetOnly) {
         const serviceTierError = providerServiceTierConfigError(name, next);
         if (serviceTierError) return jsonResponse({ error: serviceTierError }, 400);
-        const resolvedError = await providerDestinationResolvedError(name, next);
+        // Same DNS gate as POST and re-enable: the canonical built-in OpenAI forward
+        // provider may resolve through Clash/Mihomo fake-IP DNS (198.18.0.0/15), so the
+        // ordinary PATCH must not reject the very same destination the provider was
+        // created with. Loopback, RFC1918, metadata, and mixed dangerous answers still
+        // fail closed; nothing else gains the exception.
+        const allowBenchmarkAddresses = name === "openai" && isCanonicalOpenAiForwardProvider(next);
+        const resolvedError = await providerDestinationResolvedError(name, next, { allowBenchmarkAddresses });
         if (resolvedError) return jsonResponse({ error: resolvedError }, 400);
       }
     } else if (applied.enablingOpenAi) {
@@ -780,7 +1236,10 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       if (replay.editorTouched && !pacingOnly) {
         const syncError = canonicalBudgetOnly
           ? canonicalOpenAiBudgetPatchError(replay.next, rawBody, keys, config)
-          : providerManagementConfigError(name, replay.next)
+          : providerManagementConfigError(
+              name,
+              providerTransportValidationCandidate(replay.next as unknown as Record<string, unknown>),
+            )
             ?? providerEmptyToolOutputConfigError(name, replay.next);
         if (syncError) {
           replayError = syncError;
@@ -799,8 +1258,25 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       }
       // A PATCH that managed headers owns the resulting block: the clear path restores
       // registry static headers, so exact-match stripping must not erase them again.
-      config.providers[name] = replay.headersTouched ? replay.next : stripRegistryOnlyStaticHeaders(name, replay.next);
-      saveConfigPreservingClaudeCode(config);
+      const candidate = replay.headersTouched ? replay.next : stripRegistryOnlyStaticHeaders(name, replay.next);
+      const pinsTouched = Object.hasOwn(rawBody, "pinnedReasoningEffort") || Object.hasOwn(rawBody, "modelPinnedReasoningEfforts");
+      if (pinsTouched) {
+        const validation = validateConfigCandidate({ ...config, providers: { ...config.providers, [name]: candidate } });
+        if (!validation.ok) { replayError = validation.error; return; }
+      }
+      const previous = Object.getOwnPropertyDescriptor(config.providers, name);
+      const rollback = pinsTouched ? captureConfigTopLevelRollback(config, []) : undefined;
+      try {
+        config.providers[name] = candidate;
+        (deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode)(config);
+      } catch (error) {
+        if (rollback) {
+          if (previous) Object.defineProperty(config.providers, name, previous);
+          else delete config.providers[name];
+          rollback();
+        }
+        throw error;
+      }
     });
     if (replayError !== undefined) return jsonResponse({ error: replayError }, 409);
     reconcileLiveStateStores();
@@ -877,6 +1353,28 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         message: `Connected. ${live.models.length} models.`,
       });
     }
+    if (prov.adapter === "qoder") {
+      const started = Date.now();
+      const profile = resolveQoderProfile(prov.baseUrl);
+      if (!profile) {
+        return jsonResponse({ ok: false, latencyMs: 0, error: "qoder discovery refused a non-canonical destination" });
+      }
+      const live = await fetchQoderModels(profile, apiKey ?? "");
+      const latencyMs = Date.now() - started;
+      if (!live.ok) {
+        return jsonResponse({
+          ok: false,
+          latencyMs,
+          error: `qoder discovery ${live.error}${live.detail ? `: ${live.detail}` : ""}`,
+        });
+      }
+      return jsonResponse({
+        ok: true,
+        latencyMs,
+        models: live.models.length,
+        message: `Connected. ${live.models.length} models.`,
+      });
+    }
     const project = prov.project ?? snapshot?.projectId;
     if (antigravity && !project) {
       return jsonResponse({ ok: false, latencyMs: 0, error: "Antigravity project unavailable — re-run `ocx login google-antigravity`" });
@@ -885,16 +1383,20 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const discovery = resolveProviderModelDiscovery(name, prov);
     const started = Date.now();
     try {
+      // Same canonical-URL TUN transparency as catalog discovery: the registry's
+      // own fixed discovery URL survives purely-benchmark (Clash/Surge/Mihomo
+      // fake-IP) DNS without proxy env.
+      const outboundDependencies = { isCanonicalUrl: isRegistryModelDiscoveryUrl };
       const res = method === "POST"
         ? await providerOutboundPost(name, prov, modelsUrl, {
           headers,
           body: JSON.stringify({ project }),
           signal: AbortSignal.timeout(8000),
-        })
+        }, outboundDependencies)
         : await providerOutboundGet(name, prov, modelsUrl, {
           headers,
           signal: AbortSignal.timeout(8000),
-        });
+        }, outboundDependencies);
       const latencyMs = Date.now() - started;
       const redirectError = await providerRedirectError(res, modelsUrl);
       if (redirectError) {
@@ -927,13 +1429,19 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         return jsonResponse({ ok: false, latencyMs, error: "upstream CCA model discovery returned an unexpected shape" });
       }
       // OpenAI-style lists (and Together top-level arrays) use the same validation/dedupe/filter
-      // as catalog discovery. Google's /v1beta/models uses `models[].name` and remains a
-      // connectivity-only count because it is not an authoritative catalog source.
+      // as catalog discovery. Google AI Studio parses the native `models[]` envelope and filters to
+      // `generateContent`, while other providers fall back to generic envelope rows if they return `models[]`.
       const record = bounded.value !== null && typeof bounded.value === "object" && !Array.isArray(bounded.value)
         ? bounded.value as Record<string, unknown>
         : undefined;
+      const isAiStudio = effectiveGoogleMode(name, prov) === "ai-studio";
+      const googleAiStudio = !ccaModels && isAiStudio
+        ? extractGoogleAiStudioModelItems(bounded.value, discovery.maxModels)
+        : undefined;
       const extracted = ccaModels
         ? undefined
+        : googleAiStudio?.ok
+        ? googleAiStudio
         : Array.isArray(bounded.value) || Array.isArray(record?.data)
         ? extractProviderModelItems(bounded.value, discovery)
         : extractModelEnvelopeRows(bounded.value, discovery.maxModels, ["models"]);
@@ -999,7 +1507,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     delete config.providers[name];
     const { dropProviderCustomModels } = await import("../../providers/provider-id-rewrite");
     const droppedCustomModels = dropProviderCustomModels(config, name);
-    setProviderContextCap(config, name, false);
+    forgetProviderContextCap(config, name);
     save(config);
     await replaceProviderAccountSet(name, null);
     reconcileLiveStateStores();
@@ -1015,7 +1523,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
   }
 
   if (url.pathname === "/api/provider-context-caps" && req.method === "GET") {
-    return jsonResponse({ cap: DEFAULT_PROVIDER_CONTEXT_CAP, value: globalContextCapValue(config), caps: providerContextCaps(config) });
+    return jsonResponse({ cap: DEFAULT_PROVIDER_CONTEXT_CAP, value: globalContextCapValue(config), caps: providerContextCaps(config), values: selectedProviderContextCaps(config) });
   }
 
   if (url.pathname === "/api/provider-context-caps" && req.method === "PUT") {
@@ -1031,7 +1539,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       ok: true,
       cap: DEFAULT_PROVIDER_CONTEXT_CAP,
       value: globalContextCapValue(config),
-      caps: providerContextCaps(config),
+      caps: providerContextCaps(config), values: selectedProviderContextCaps(config),
       catalogRefresh,
     });
 
@@ -1050,8 +1558,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
 
     // Branch 1: per-provider toggle (checked first: a per-provider request may carry an
     // explicit `value`, which must never fall through to the global-value branch). Enable
-    // writes the current global default unless an explicit per-provider value is supplied;
-    // that value is never copied to other providers.
+    // restores the selected provider value, then the global default, unless an explicit
+    // per-provider value is supplied; that value is never copied to other providers.
     if (typeof body.provider === "string" && typeof body.enabled === "boolean") {
       const provider = body.provider.trim();
       if (!isValidProviderName(provider)) {

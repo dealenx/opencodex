@@ -32,6 +32,16 @@ the stored main credential when an OpenCodex admission bearer is substituted). A
 Pool routing excludes unentitled accounts. If no roster can be confirmed, the gated row fails closed
 instead of spending a prompt on an upstream 400.
 
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` and `gpt-6-astra` are deliberately **not** gated that
+way: they are listed on every install, whatever the entitlement roster says. opencodex asks upstream
+under a client version new enough to return them, but it cannot make an answer appear — an
+unconfirmed account, a timed-out lookup or a shard that has not caught up would otherwise make the
+model disappear from the picker with no explanation. Listing them means the request is sent and you
+see the real upstream status instead. An account that does not have one of these models will get an
+upstream refusal at request time rather than an absent row, and in a multi-account Pool the request
+is no longer steered to the account that owns the model first. `disabledModels` is the lever for
+hiding any of them.
+
 A separate, explicit `customModels` entry can expose the same wire id as
 `openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
 
@@ -53,6 +63,23 @@ metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not
 or grant account entitlement. The separately billed
 `openai-apikey/daybreak-blue-latest` API row is a different route and its 1,050,000 / 922,000 limits
 are never copied into the Codex-login row.
+
+For custom Astra and Daybreak rows on that canonical `openai` Codex-forward destination,
+explicit `reasoningEfforts` are bounded by the model's pinned Codex capabilities. A custom
+`["none", "minimal", "low"]` becomes `["low"]` in the catalog; a nonempty list with no
+supported values also falls back to the native default as a single choice. An explicit `[]`
+stays empty and has no advertised default. A declared default is retained only if it belongs to
+the resulting list; otherwise the native default is used when present, then the first surviving
+choice. Stored custom configuration is unchanged, and repeated syncs do not add `max` back to a
+narrow custom list.
+
+This requires the exact provider, destination, and capability-backed model identity. An arbitrary
+gateway such as `YYLJ/gpt-6-astra` does not inherit native capabilities from its name. Its explicit
+custom ladder continues to override discovered provider metadata under the normal routed rules.
+Codex's native Astra `ultra` choice is retained: it is a client delegation mode converted to a
+supported wire effort, distinct from the [API model's effort list](https://developers.openai.com/api/docs/models/gpt-6-astra).
+Catalog normalization does not rewrite existing thread settings or establish support for a
+particular installed Desktop version.
 
 When the `codexAccountNamespaces` map is empty, account-qualified picker rows are off. If
 `codexAccountPickerEnabled` is omitted with a non-empty map, they are treated as enabled for
@@ -137,10 +164,12 @@ ocx access test anthropic/claude-sonnet-5 --protocol responses
 ```
 
 Both paths route correctly **once the request reaches the proxy** — that part is covered by
-tests. What is not established is whether the app still sends the configured model while reserve
-mode is active; if the client rewrites or refuses it before the request leaves, no proxy-side
-setting changes that. Treat the explicit-selection route as worth trying rather than a confirmed
-workaround.
+tests. The Codex desktop app, however, does not send the configured model while reserve mode is
+active: it decides reserve from its own `wham/usage` poll (`luna_reserve` upsell plus an allowed
+`gpt-reserve` additional limit) and forces the model setting to `gpt-reserve` before the request
+leaves, so the `config.toml` route is overridden in the app. Use `ocx access test`, Claude Code
+through the proxy (`ocx claude`), or any direct `/v1` client until the window resets. See
+[Routed models during Codex reserve mode](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
 
 ## Why routed models show up
 
@@ -290,3 +319,5 @@ ocx sync
 
 opencodex rewrites `models_cache.json` with a deliberately stale cache wrapper whenever catalog
 visibility, priority, or metadata changes, so the next Codex model refresh reads the new catalog.
+
+After a catalog or model-cache write, OpenCodex invalidates its cached app-server observation so the next request checks process freshness again. A configuration sync also invalidates the observation when catalog contents are unchanged. This refresh does not restart Codex processes.

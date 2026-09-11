@@ -1,5 +1,18 @@
 #!/usr/bin/env bun
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
+
+// Best-effort recovery for runtime execution and spawned children if launched
+// from an unlinked/deleted working directory (runs after hoisted ESM module imports).
+try {
+  process.cwd();
+} catch {
+  try {
+    process.chdir(homedir());
+  } catch {
+    /* best-effort */
+  }
+}
 import { currentExternalCodexModelProvider, restoreNativeCodex, restoreNativeCodexAsync, shouldInjectApiAuthHeader } from "../codex/inject";
 import { stripGrokConfig } from "../grok/inject";
 import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "../update/stop-contract.mjs";
@@ -9,6 +22,7 @@ import {
   runCodexHistoryJob,
 } from "../codex/history-job";
 import { reconcileJournal } from "../codex/journal";
+import { inspectClientRotationRecoveryGate, readClientConnectionState } from "../client/state";
 import {
   codexAutoStartEnabled,
   getConfigDir,
@@ -48,7 +62,7 @@ import {
 } from "./tray-proxy";
 import { requestBoundSystemRestart } from "./system-restart-client";
 import { installCrashGuards } from "../lib/crash-guard";
-import { dispatchCommand } from "./dispatch";
+import { dispatchCommand , decideStartWithLiveOwner } from "./dispatch";
 import { findAvailablePort, isAddrInUse, PortUnavailableError, shouldPersistSelectedPort, waitForPortAvailable } from "../server/ports";
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { createReadinessGate } from "../server/readiness";
@@ -58,7 +72,6 @@ import { isProcessAlive, ProxyOwnershipRefusedError, stopProxy } from "../lib/pr
 import { loadServiceTokenFromFile } from "../lib/service-secrets";
 import { assertNotAdminToken, diagnoseService, isServiceOwnershipError, proxyStillLiveAfterStop, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalledDetailed, uninstallServiceIfInstalled, uninstallServiceDetailed } from "../service";
 import { formatStartupRoutingDetail, startupHealthSummary } from "../codex/autostart-health";
-import { drainAndShutdown, isRecyclingForExit, startServer } from "../server";
 import { injectSystemEnv, reconcileShellHook, revertSystemEnv, uninstallShellHook } from "../server/system-env";
 import { buildDesktop3pRegistry } from "../claude/desktop-3p";
 import { startTokenGuardian } from "../oauth/token-guardian";
@@ -79,6 +92,15 @@ import {
   grokSyncFailureMessage,
   reconcileEnsureDesiredIntegrations,
 } from "./ensure-desired-integrations";
+import { refreshOwnedCatalogIntegrations } from "../integrations/catalog-refresh";
+import { loadExportModels } from "../server/management/model-rows";
+
+import { removeOwnedConfigAfterDesktopCleanup } from "./uninstall-client-state";
+import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
+import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { initializeNodeLauncherContext } from "./launcher-context";
+import { createLocalAttestationSecret } from "../lib/local-management-attestation";
+import { MEMORY_DRAIN_RESTART_MS, REPLACEMENT_READY_TIMEOUT_MS } from "../lib/system-restart-contract";
 
 /**
  * A failed shell-hook reconcile is not cosmetic: a stale hook keeps sourcing
@@ -92,13 +114,25 @@ function reportShellHookFailure(result: { state: "installed" | "absent" | "faile
   console.warn("   Check ~/.zshrc for the '# opencodex claude-env hook' block.");
 }
 
-
-import { removeOwnedConfigState } from "../lib/config-ownership";
-import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
-import { selfLaunchArgv } from "../lib/self-launch-argv";
-import { initializeNodeLauncherContext } from "./launcher-context";
-import { createLocalAttestationSecret } from "../lib/local-management-attestation";
-import { MEMORY_DRAIN_RESTART_MS, REPLACEMENT_READY_TIMEOUT_MS } from "../lib/system-restart-contract";
+async function refreshOwnedRaycastCatalog(
+  config: ReturnType<typeof loadConfig>,
+  port: number,
+): Promise<void> {
+  try {
+    const outcomes = await refreshOwnedCatalogIntegrations({
+      models: () => loadExportModels(config),
+      config,
+      port,
+    }, ["raycast"]);
+    for (const outcome of outcomes) {
+      if (!outcome.ok) {
+        console.error(`⚠️  Raycast integration was not refreshed: ${outcome.reason}`);
+      }
+    }
+  } catch (error) {
+    console.error(`⚠️  Raycast integration was not refreshed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 initializeNodeLauncherContext();
 
@@ -149,7 +183,10 @@ function startArgv(port?: number): string[] {
   return selfLaunchArgv(args);
 }
 
-async function chooseListenPort(requestedPort?: number): Promise<number> {
+async function chooseListenPort(
+  requestedPort?: number,
+  options: { sibling?: boolean } = {},
+): Promise<number> {
   const config = loadConfig();
   const preferred = requestedPort ?? config.port ?? 10100;
   const hardPin = requestedPort !== undefined && requestedPort > 0;
@@ -197,7 +234,7 @@ async function chooseListenPort(requestedPort?: number): Promise<number> {
     if (preferred > 0 && selected !== preferred) {
       console.log(`⚠️  Port ${preferred} is busy; starting opencodex on ${selected}.`);
     }
-    if (shouldPersistSelectedPort(config.port, selected, preferred)) {
+    if (shouldPersistSelectedPort(config.port, selected, preferred, options)) {
       config.port = selected;
       saveConfig(config);
     }
@@ -224,7 +261,12 @@ async function findProxyOwnerBeforeJournalRecovery(
   // The probe established that the snapshotted owner is stale. Compare before
   // deleting so a concurrent start that rewrote the PID file keeps its state.
   removePidIfValueIs(pidSnapshot);
-  if (!currentExternalCodexModelProvider()) reconcileJournal();
+  if (!currentExternalCodexModelProvider()) {
+    const clientState = readClientConnectionState();
+    reconcileJournal(clientState.kind === "connected"
+      ? { activeClientApiKeyId: clientState.value.apiKeyId }
+      : undefined);
+  }
   return { live: null, pidSnapshot };
 }
 
@@ -248,20 +290,52 @@ async function handleStart(options: { block?: boolean } = {}) {
   // shutdown then left no runtime record for discovery at all. `handleEnsure`
   // already passes this; `handleStart` is the path that did not.
   const owner = await findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true });
+  let siblingStart = false;
   if (owner.live) {
-    // Service-wrapper context (opencodex-service.cmd `:loop`): a healthy proxy from
-    // ANY source means the requested port is already served. Exit 0 so the wrapper's
-    // `if %ERRORLEVEL% NEQ 0` retry loop terminates instead of respawning every 5s
-    // against a listener it can never claim (observed as an endless
-    // "Proxy already running" service.log loop).
-    // Only the exact "1" sentinel takes this path — the same check syncCleanup
-    // uses — so an env value like "0" or "false" cannot bypass the conflict error.
-    if (process.env.OCX_SERVICE === "1") {
+    // Rationale and the full decision table live on `decideStartWithLiveOwner`.
+    const decision = decideStartWithLiveOwner({
+      livePort: owner.live.port,
+      requestedPort,
+      ocxService: process.env.OCX_SERVICE,
+    });
+    if (decision === "service-stay-out") {
+      // Service-wrapper context (opencodex-service.cmd `:loop`): a healthy proxy from
+      // ANY source means the requested port is already served. Exit 0 so the wrapper's
+      // `if %ERRORLEVEL% NEQ 0` retry loop terminates instead of respawning every 5s
+      // against a listener it can never claim (observed as an endless
+      // "Proxy already running" service.log loop).
       console.log(`Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}); service wrapper staying out of the way.`);
       process.exit(0);
     }
-    console.error(`⚠️  Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}). Use 'ocx stop' first.`);
-    process.exit(1);
+    if (decision === "refuse") {
+      console.error(`⚠️  Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}). Use 'ocx stop' first.`);
+      process.exit(1);
+    }
+    // Sibling path. Honest about the side effects it shares with any start in this home:
+    // the new instance takes over this home's ocx.pid / runtime-port.json while it runs,
+    // and re-points this home's Codex config at the new port when injection applies.
+    // What it must NOT do is persist its port into config.port: the configured-port
+    // proxy is still the owner of this home, and a later `ocx service` reads config.port
+    // to bake the service (observed: a probe on 10198 left the service pinned there).
+    siblingStart = true;
+    console.warn(
+      `Proxy already running on port ${owner.live.port}; starting a second instance on requested port ${requestedPort}. `
+      + `The new instance takes over this home's pid/runtime records and Codex config while it runs.`,
+    );
+  }
+
+  const clientState = readClientConnectionState();
+  if (clientState.kind === "invalid" || clientState.kind === "mismatched") {
+    throw new Error(`client startup refused: ${clientState.reason}`);
+  }
+  const rotationGate = inspectClientRotationRecoveryGate(clientState);
+  if (clientState.kind === "connected") {
+    if (rotationGate.kind === "recovery-required" || rotationGate.kind === "unsafe") {
+      throw new Error(`client startup refused: ${rotationGate.reason}`);
+    }
+    const { startClientRuntime } = await import("../client/runtime");
+    await startClientRuntime({ port: requestedPort, block: options.block });
+    return;
   }
 
   // Interactive-only update prompt. Must run BEFORE we bind a port / write a
@@ -272,7 +346,8 @@ async function handleStart(options: { block?: boolean } = {}) {
   // Port selection is check-then-bind: a concurrent `ocx start`/`ensure` can win the port
   // between the probe and Bun.serve. Soft starts may re-pick; hard-pinned `--port` retries
   // the same port only (never hop — that was the remaining PR #152 gap).
-  let port = await chooseListenPort(requestedPort);
+  let port = await chooseListenPort(requestedPort, { sibling: siblingStart });
+  const { drainAndShutdown, isRecyclingForExit, startServer } = await import("../server");
   // One private readiness gate for this startServer invocation, captured by the
   // listener's closure. handleStart owns it and transitions it after the
   // post-startup sync settles. A second startServer in the same process would
@@ -301,7 +376,7 @@ async function handleStart(options: { block?: boolean } = {}) {
         continue;
       }
       console.log(`⚠️  Port ${port} was taken while starting; picking another...`);
-      port = await chooseListenPort(requestedPort);
+      port = await chooseListenPort(requestedPort, { sibling: siblingStart });
     }
   }
   // A single request's streaming error must never crash the daemon serving every
@@ -405,8 +480,8 @@ async function handleStart(options: { block?: boolean } = {}) {
   reportShellHookFailure(reconcileShellHook(systemEnv.injected));
   await maybeShowStarPrompt(); // once-only Yes/No GitHub-star prompt on first interactive start
   // Codex sync owns the ready/failed verdict, but its successful transition is
-  // deferred until the best-effort Claude roster reconciliation settles. This
-  // keeps /readyz closed across both startup writes without making an optional
+  // deferred until the best-effort Claude roster and Desktop registry settle. This
+  // keeps /readyz closed across startup initialization without making an optional
   // Claude integration failure prevent the proxy from starting.
   const startupSync = await reconcileClientStartupBeforeReady(
     readinessGate,
@@ -414,8 +489,32 @@ async function handleStart(options: { block?: boolean } = {}) {
     () => systemEnv.injected
       ? Promise.resolve(null)
       : syncClaudeAgentDefsAtProxyStartup(config, port),
+    async () => {
+      try {
+        const { fetchAllModels } = await import("../server/management-api");
+        const { desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { resolveCodexModelEntitlements } = await import("../codex/model-entitlements");
+        const { buildDesktopDiscoveryInputs } = await import("../claude/desktop-discovery-inputs");
+        const [models, modelEntitlements] = await Promise.all([
+          fetchAllModels(config),
+          resolveCodexModelEntitlements(config, { clientVersion: null }),
+        ]);
+        const inputs = buildDesktopDiscoveryInputs({
+          config, models, modelEntitlements,
+          desktopNativeCandidates: desktopVisibleNativeSlugs(config),
+        });
+        buildDesktop3pRegistry(
+          inputs.nativeSlugs, inputs.routedModels,
+          config.claudeCode?.desktopProfile, inputs.nativeContextCap,
+        );
+      } catch {
+        // Best-effort; model discovery can rebuild it. Never reflect credential or provider errors.
+        console.warn("[opencodex] Claude Desktop model registry could not be initialized at startup.");
+      }
+    },
   );
   if (!startupSync.ran) console.log("   Codex integration OFF; startup left Codex native.");
+  await refreshOwnedRaycastCatalog(config, port);
   // #1046: one warning per startup, after BOTH writes. The server's cache
   // invalidation happens first and the catalog sync second, so the mtime is only
   // final here — and neither write site warns on its own, or a boot that hits
@@ -428,17 +527,6 @@ async function handleStart(options: { block?: boolean } = {}) {
   if (!currentExternalCodexModelProvider() && !shouldInjectApiAuthHeader(config) && config.syncResumeHistory !== false) {
     historyGuardian = startHistoryMigrationGuardian();
   }
-  // Build Desktop 3P alias registry so inbound claude-opus-4-8-{code} aliases (and legacy claude-opus-4-{code}) decode correctly.
-  try {
-    const { fetchAllModels } = await import("../server/management-api");
-    const { visibleNativeSlugs, filterCatalogVisibleModels } = await import("../codex/catalog");
-    const models = filterCatalogVisibleModels(await fetchAllModels(config), config);
-    buildDesktop3pRegistry(
-      [...visibleNativeSlugs(config)],
-      models.map(m => ({ provider: m.provider, id: m.id, contextWindow: m.contextWindow })),
-      config.claudeCode?.desktopProfile,
-    );
-  } catch { /* best-effort — registry rebuilds on first /v1/models call */ }
   // Grok Build auto-registration: additive fenced block in ~/.grok/config.toml so an installed
   // grok CLI can pick opencodex-routed models without manual config. No-op when ~/.grok is
   // absent or the bind is non-loopback; removed again by stop/eject/uninstall/shutdown.
@@ -492,6 +580,9 @@ async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Prom
         return null;
       });
       if (synced?.status === "skipped") console.log("   Codex integration OFF; startup left Codex native.");
+      // Do not refresh Raycast from saved config here: live bind/admission and
+      // secondary-listener settings may differ. Explicit sync or server startup
+      // owns catalog refresh; ensure must not overwrite a working destination.
       // Ensure env file exists for already-running proxy (may have been deleted or pre-dates this feature).
       const systemEnv = await injectSystemEnv(live.port, config).catch(() => ({ injected: false }));
       reportShellHookFailure(reconcileShellHook(systemEnv.injected));
@@ -536,6 +627,8 @@ async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Prom
     return null;
   });
   if (synced?.status === "skipped") console.log("   Codex integration OFF; startup left Codex native.");
+  // The child performs Raycast refresh with its actual startup config. The
+  // parent's pre-spawn snapshot is not authoritative for a client-file write.
   // The child opens /healthz before its best-effort roster reconcile. Await the same idempotent
   // operation in the parent so `ocx ensure` cannot report success while stale ocx-*.md files are
   // still observable. Always use the live port, including fallback-port starts.
@@ -737,6 +830,7 @@ async function handleStop() {
   // restart-window wait; launchd, systemd and WinSW are down when they say so.
   let schedulerCanRespawn = false;
   let stoppedService = false;
+  let nativeRestoreHandledByProxy = false;
   // An ownership mismatch means the service manager was never even contacted: the installed
   // service is still live and will respawn the proxy. Tearing down SHARED state in that
   // situation (native Codex config, the Grok fence) removes config out from under a running
@@ -785,17 +879,22 @@ async function handleStop() {
    * guessed one fails closed into manual recovery rather than letting a later probe read
    * "the configured port refuses" as proof that the right proxy is down.
    */
-  const stopWithDeferral = async (pid: number, discovered?: { hostname: string; port: number } | null): Promise<void> => {
+  const stopWithDeferral = async (pid: number, discovered?: { hostname: string; port: number } | null): Promise<boolean> => {
     // Resolve ONCE. Reading the runtime record twice let the receipt name the configured
     // guess while the request went to a runtime endpoint that appeared in between.
     const exact = discovered ?? endpointOf(readRuntimePort(pid));
     claimTeardown(exact ?? configuredEndpoint(), exact ? "exact" : "guessed");
-    await stopProxy(pid, {
+    const graceful = await stopProxy(pid, {
       deferSharedTeardownNonce: teardownNonce,
       // Only an exact endpoint may direct the request; the configured fallback is a guess
       // good enough to record an obligation against, not to POST a stop to.
       runtimeEndpoint: exact ?? undefined,
     });
+    // A valid receipt means the proxy deferred shared teardown to this process. If the
+    // receipt could not be written, the proxy restores it itself and the caller must not
+    // attempt a second restore after a graceful stop. A hard-kill always leaves restore
+    // to this process.
+    return graceful && !teardownNonce;
   };
   try {
     const serviceStop = stopServiceIfInstalledDetailed();
@@ -838,7 +937,7 @@ async function handleStop() {
       // verification below, so a survivor does not get its client config pulled first.
       // The receipt goes down first — the proxy honours the deferral only when it can
       // see one, so an unrecordable claim degrades to the child doing its own teardown.
-      await stopWithDeferral(pid);
+      nativeRestoreHandledByProxy = await stopWithDeferral(pid);
       console.log(`✅ Proxy (PID ${pid}) stopped.`);
       removePid(pid);
       removeRuntimePort(pid);
@@ -868,7 +967,10 @@ async function handleStop() {
       try {
         // The probe already found where it answers, and on this path the runtime record is
         // typically what went missing in the first place.
-        await stopWithDeferral(live.pid, { hostname: live.hostname ?? "127.0.0.1", port: live.port });
+        nativeRestoreHandledByProxy = await stopWithDeferral(
+          live.pid,
+          { hostname: live.hostname ?? "127.0.0.1", port: live.port },
+        );
         console.log(`✅ Proxy (PID ${live.pid}) stopped.`);
       } catch (err) {
         stopFailed = true;
@@ -986,7 +1088,7 @@ async function handleStop() {
       console.error("   The obligation is preserved; retry once the proxy is confirmed stopped.");
     }
   }
-  const restoreBlocked = ownershipBlocked || inheritedBlocks;
+  const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy;
   if (!restoreBlocked) {
     if (recoveredNonces.length > 0) {
       // A previous deferred stop died before restoring, and the probe says its endpoint is
@@ -1205,8 +1307,8 @@ async function handleUninstall() {
   }
 
   if (failures.length === 0) {
-    await runStep("opencodex config removed", () => {
-      const result = removeOwnedConfigState(getConfigDir());
+    await runStep("opencodex config removed", async () => {
+      const result = await removeOwnedConfigAfterDesktopCleanup(observed);
       if (result.status === "absent") return false;
       if (result.status === "removed") return true;
       const residual = result.residualPaths.length > 0
@@ -1294,6 +1396,10 @@ async function handleStatus() {
   console.log(`   Runtime: ${status.json.paths.runtime}`);
   console.log(`   Runtime source: ${status.json.runtime.source}${status.json.runtime.overrideEnv ? ` (${status.json.runtime.overrideEnv})` : ""}`);
   console.log(`   Default provider: ${status.json.defaultProvider}`);
+  console.log(`   Remote hub: ${status.json.connection.state}${status.json.connection.serverUrl ? ` (${status.json.connection.serverUrl})` : ""}`);
+  if (status.json.connection.state === "invalid" || status.json.connection.state === "mismatched") {
+    console.log(`   ⚠️  ${status.json.connection.reason}`);
+  }
   console.log(`   Codex autostart: ${status.json.codexAutostart ? "enabled" : "disabled"}`);
   console.log(`   Restart safety: ${startupHealthSummary(status.json.startup)}`);
   console.log(`   ${formatStartupRoutingDetail(status.json.startup)}`);
@@ -1322,9 +1428,13 @@ async function handleStatus() {
     }
   }
   const { collectOAuthHealthEntriesForCli, oauthLoginSummary } = await import("../oauth");
+  const { emailMaskingEnabled } = await import("../lib/privacy");
   const { formatOAuthHealthForStatus } = await import("./status-oauth");
   console.log(`   OAuth logins:`);
-  for (const e of oauthLoginSummary()) {
+  // The operator's own `privacy.maskEmails` decision applies to the CLI too: `ocx status` is not
+  // the dashboard, but it reads the same stored addresses, and a flag that only moved one of the
+  // two would leave the operator unable to tell which surface they had configured.
+  for (const e of oauthLoginSummary(emailMaskingEnabled(loadConfig()))) {
     console.log(`     ${e.provider.padEnd(10)} ${e.loggedIn ? `✓ logged in${e.email ? ` (${e.email})` : ""}` : "✗ not logged in"}`);
   }
   const oauthHealthBlock = formatOAuthHealthForStatus(await collectOAuthHealthEntriesForCli());
@@ -1336,8 +1446,31 @@ async function handleStatus() {
 }
 
 async function handleRecoverHistory() {
+  if (args[1] === "--ocx-compaction") {
+    const threadId = args[2];
+    if (args.length !== 4 || !threadId || args[3] !== "--yes") {
+      console.error("Usage: ocx recover-history --ocx-compaction <thread-id> --yes");
+      console.error("This rewrites one rollout after saving a private byte-for-byte backup. Close that Codex thread before retrying.");
+      process.exit(1);
+    }
+    console.error("WARNING: this converts OpenCodeX-owned ocx1 compaction state into a plain summary for native Codex replay.");
+    try {
+      const { recoverOcxCompactionHistory } = await import("../codex/ocx-compaction-history");
+      const result = recoverOcxCompactionHistory({ threadId });
+      if (result.replaced === 0) {
+        console.log(`Thread ${threadId} has no repairable ocx1 compaction history; no files changed.`);
+        return;
+      }
+      console.log(`Recovered ${result.replaced} ocx1 compaction item(s) in thread ${threadId}.`);
+      console.log(`Backup: ${result.backupPath}`);
+      return;
+    } catch (error) {
+      console.error(`Recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  }
   if (args[1] !== "--legacy-openai") {
-    console.error("Usage: ocx recover-history --legacy-openai --yes");
+    console.error("Usage: ocx recover-history (--legacy-openai | --ocx-compaction <thread-id>) --yes");
     console.error("This force-relabels every user-message opencodex row to OpenAI, including legitimate dedicated-provider history. Back up first and use it only for pre-backup legacy recovery.");
     process.exit(1);
   }

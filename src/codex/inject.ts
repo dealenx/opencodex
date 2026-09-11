@@ -6,6 +6,7 @@ import {
   readConfigAdmissionSnapshot,
   subagentDefaultSyncEffective,
   websocketsEnabled,
+  withConfigMutationLockSync,
 } from "../config";
 import { CodexWriteLockSkipped, withCodexWriteLock } from "./codex-write-lock";
 import { shouldSyncCodexOnStart } from "./desired-state";
@@ -30,8 +31,10 @@ import {
   resolveEffectiveUserIdentity,
 } from "./user-identity";
 import {
+  hasUnverifiedJournalBaseline,
   markJournalInjectedState,
   journaledInjectedOpenaiBaseUrl,
+  journaledInjectedRealtimeWsBaseUrl,
   journaledInjectedCatalogPath,
   removeJournal,
   restoreJournalState,
@@ -49,9 +52,11 @@ import {
 } from "./history-job";
 import {
   OCX_SECTION_MARKER,
+  REALTIME_WS_BASE_URL_KEY,
   hasInjectedCodexRouting,
   hasInjectedOpenaiBaseUrl,
   isRootOpenaiBaseUrlLine,
+  isRootRealtimeWsBaseUrlLine,
   providerTableStart,
   providerTableString,
   rootTomlString,
@@ -74,6 +79,9 @@ import {
   type ManagedSubagentDefaults,
 } from "./subagent-defaults";
 import type { OcxConfig } from "../types";
+import { isLoopbackHostname, shouldInjectApiAuthHeader } from "./loopback-target";
+
+export { isLoopbackHostname, shouldInjectApiAuthHeader } from "./loopback-target";
 
 // Ownership predicates live in `./injected-marker` so `journal.ts` can reach them
 // without importing this module back. Re-exported for existing external callers.
@@ -139,6 +147,92 @@ export interface InjectCodexOptions {
    * provider discovery so a deterministic config refusal cannot degrade an existing catalog.
    */
   validateOnly?: boolean;
+  /** Explicit remote routing target. Absence preserves byte-compatible standalone output. */
+  routingTarget?: CodexRoutingTarget;
+  journalOwner?: { kind: "process" } | { kind: "client"; apiKeyId: string };
+  /** Synchronous read-only client ownership guard, evaluated at the artifact commit boundary. */
+  beforeClientWrite?: () => void;
+}
+
+function runClientWriteGuard(guard: InjectCodexOptions["beforeClientWrite"]): void {
+  const result: unknown = guard?.();
+  if (result !== null && (typeof result === "object" || typeof result === "function")
+    && typeof (result as { then?: unknown }).then === "function") {
+    // Reject async guards without leaving their eventual rejection unhandled.
+    void Promise.resolve(result).catch(() => {});
+    throw new Error("Connected client write guard must be synchronous");
+  }
+}
+
+export interface CodexRoutingTarget {
+  baseUrl: string;
+  requiresAdmissionToken: boolean;
+  tokenEnv: "OPENCODEX_API_AUTH_TOKEN";
+  /**
+   * Opt-in authless Codex Desktop mode (#1107): inject the dedicated provider table with
+   * `requires_openai_auth = false` so Desktop skips the ChatGPT login gate. Only ever true for
+   * loopback targets that need no admission token; non-loopback admission is a separate layer
+   * and is never weakened by this flag.
+   */
+  desktopAuthless?: boolean;
+  /** Select the dedicated provider identity so Codex owns compaction locally. */
+  clientCompaction?: boolean;
+}
+
+function validateCodexRoutingTarget(target: CodexRoutingTarget): CodexRoutingTarget {
+  let parsed: URL;
+  try {
+    parsed = new URL(target.baseUrl);
+  } catch {
+    throw new TypeError("Codex routing target must be an absolute HTTP(S) /v1 URL");
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== "/v1"
+    || parsed.search
+    || parsed.hash
+    || target.tokenEnv !== "OPENCODEX_API_AUTH_TOKEN"
+  ) {
+    throw new TypeError("Codex routing target must be a canonical HTTP(S) /v1 URL without credentials, query, or fragment");
+  }
+  return { ...target, baseUrl: `${parsed.origin}/v1` };
+}
+
+/** Provider-table form is used when auth, admission, or compaction policy needs a dedicated provider. */
+function usesProviderTable(target: CodexRoutingTarget): boolean {
+  return target.requiresAdmissionToken
+    || target.desktopAuthless === true
+    || target.clientCompaction === true;
+}
+
+export function standaloneCodexRoutingTarget(
+  port: number,
+  config?: Pick<
+    OcxConfig,
+    "hostname" | "unauthenticatedLoopbackListener" | "codexDesktopAuthless" | "codexClientCompaction"
+  >,
+): CodexRoutingTarget {
+  const loopback = config?.unauthenticatedLoopbackListener;
+  const effectivePort = loopback?.enabled ? loopback.port : port;
+  const hostname = loopback?.enabled ? undefined : config?.hostname;
+  const requiresAdmissionToken = loopback?.enabled ? false : shouldInjectApiAuthHeader(config);
+  return {
+    baseUrl: `http://${providerBaseHost(hostname)}:${effectivePort}/v1`,
+    requiresAdmissionToken,
+    tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+    ...(config?.codexDesktopAuthless === true && !requiresAdmissionToken
+      ? { desktopAuthless: true }
+      : {}),
+    ...(config?.codexClientCompaction === true && !requiresAdmissionToken
+      ? { clientCompaction: true }
+      : {}),
+  };
+}
+
+function routingTargetOrigin(target: CodexRoutingTarget): string {
+  return target.baseUrl.slice(0, -3);
 }
 
 function configuredManagedSubagentDefaults(
@@ -166,23 +260,6 @@ function configuredManagedSubagentDefaults(
  * whatever `[table]` happened to be open last (e.g. `[plugins."chrome@openai-bundled"]`), so Codex
  * never saw a global model_provider and silently fell back to the `openai` (ChatGPT) provider.
  */
-/**
- * True only for hostnames that bind loopback ONLY. Wildcard binds ("0.0.0.0", "::") are NOT
- * loopback: they expose the proxy on every interface and therefore require the admission token.
- * Do not use `providerBaseHost` for this decision — it folds wildcards to 127.0.0.1 because it
- * answers "what address do I dial", which is a different question from "is this exposed".
- */
-export function isLoopbackHostname(hostname: string | undefined): boolean {
-  const normalized = (hostname ?? "127.0.0.1").trim().toLowerCase();
-  return (
-    normalized === "" ||
-    normalized === "localhost" ||
-    normalized === "127.0.0.1" ||
-    normalized === "::1" ||
-    normalized === "[::1]"
-  );
-}
-
 export function providerBaseHost(hostname: string | undefined): string {
   const trimmed = (hostname ?? "127.0.0.1").trim();
   const lower = trimmed.toLowerCase();
@@ -200,41 +277,54 @@ export function providerBaseHost(hostname: string | undefined): string {
   return trimmed.includes(":") ? `[${trimmed}]` : trimmed;
 }
 
-export function shouldInjectApiAuthHeader(
-  config: Pick<OcxConfig, "hostname" | "unauthenticatedLoopbackListener"> | undefined,
-): boolean {
-  // The unauthenticated loopback listener is a loopback bind, so it admits without a
-  // credential (#1102). Emitting the env header anyway would be worse than useless: the
-  // directly-spawned app-server this exists for has no OPENCODEX_API_AUTH_TOKEN in its
-  // environment, and Codex would send an empty header value.
-  if (config?.unauthenticatedLoopbackListener?.enabled) return false;
-  return !isLoopbackHostname(config?.hostname);
-}
-
 export function buildProviderTableBlock(
   port: number,
+  supportsWebsockets?: boolean,
+  includeApiAuthHeader?: boolean,
+  hostname?: string,
+): string;
+export function buildProviderTableBlock(
+  target: CodexRoutingTarget,
+  supportsWebsockets?: boolean,
+): string;
+export function buildProviderTableBlock(
+  portOrTarget: number | CodexRoutingTarget,
   supportsWebsockets = false,
   includeApiAuthHeader = false,
   hostname?: string,
 ): string {
-  const host = providerBaseHost(hostname);
+  const target = typeof portOrTarget === "number"
+    ? validateCodexRoutingTarget({
+        baseUrl: `http://${providerBaseHost(hostname)}:${portOrTarget}/v1`,
+        requiresAdmissionToken: includeApiAuthHeader,
+        tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+      })
+    : validateCodexRoutingTarget(portOrTarget);
+  return buildProviderTableBlockForTarget(target, supportsWebsockets);
+}
+
+function buildProviderTableBlockForTarget(
+  target: CodexRoutingTarget,
+  supportsWebsockets = false,
+): string {
   const lines = [
     "",
     OCX_SECTION_MARKER,
     "[model_providers.opencodex]",
     'name = "OpenCodex Proxy"',
-    `base_url = "http://${host}:${port}/v1"`,
+    `base_url = ${tomlString(target.baseUrl)}`,
     'wire_api = "responses"',
-    "requires_openai_auth = true",
+    // false only in the authless Desktop opt-in (#1107); true keeps the App/TUI account gate.
+    `requires_openai_auth = ${target.desktopAuthless === true ? "false" : "true"}`,
   ];
-  if (includeApiAuthHeader) {
+  if (target.requiresAdmissionToken) {
     // codex-cli 0.146+ contract (#2073): env_key sends Authorization: Bearer $VAR and
     // hard-errors on a missing/empty variable instead of silently omitting auth. It
     // coexists with requires_openai_auth (env_key wins wire auth; the flag keeps the
     // login/account UX), and the server substitutes stored main auth for our admission
     // bearer (#1686), so the modern form is strictly better than the legacy
     // env_http_headers table this line used to emit.
-    lines.push('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    lines.push(`env_key = ${tomlString(target.tokenEnv)}`);
   }
   if (supportsWebsockets) lines.push("supports_websockets = true");
   return lines.join("\n") + "\n";
@@ -243,8 +333,33 @@ export function buildProviderTableBlock(
 export function buildOpenaiBaseUrlLine(
   port: number,
   hostname?: string,
+): string;
+export function buildOpenaiBaseUrlLine(target: CodexRoutingTarget): string;
+export function buildOpenaiBaseUrlLine(
+  portOrTarget: number | CodexRoutingTarget,
+  hostname?: string,
 ): string {
-  return `openai_base_url = "http://${providerBaseHost(hostname)}:${port}/v1"`;
+  return typeof portOrTarget === "number"
+    ? `openai_base_url = "http://${providerBaseHost(hostname)}:${portOrTarget}/v1"`
+    : buildOpenaiBaseUrlLineForTarget(validateCodexRoutingTarget(portOrTarget));
+}
+
+function buildOpenaiBaseUrlLineForTarget(target: CodexRoutingTarget): string {
+  return `openai_base_url = ${tomlString(target.baseUrl)}`;
+}
+
+/**
+ * Realtime sideband override (codex-rs `experimental_realtime_ws_base_url`), written with the
+ * SAME value as `openai_base_url`. Desktop voice creates its WebRTC call through the proxy
+ * (`POST /v1/live`, answered under the Pool account the proxy selects) but, since openai/codex
+ * 438c9e98d (#35830), joins the sideband at `wss://api.openai.com/v1/live/{callId}` with the
+ * app's own login unless this key redirects it. Two accounts, one call: the join 404s. Pointing
+ * the key at the proxy sends the join through `GET /v1/live/{callId}` (src/server/live.ts),
+ * where the same Pool account is reused. codex-rs turns `http` into `ws` and appends
+ * `/live/{callId}` itself; the value must stay the canonical `/v1` root.
+ */
+export function buildRealtimeWsBaseUrlLine(target: CodexRoutingTarget): string {
+  return `${REALTIME_WS_BASE_URL_KEY} = ${tomlString(target.baseUrl)}`;
 }
 
 /**
@@ -257,11 +372,23 @@ export function setRootOpenaiBaseUrl(
   content: string,
   port: number,
   hostname?: string,
+): { content: string; keptUserBaseUrl: boolean };
+export function setRootOpenaiBaseUrl(
+  content: string,
+  target: CodexRoutingTarget,
+): { content: string; keptUserBaseUrl: boolean };
+export function setRootOpenaiBaseUrl(
+  content: string,
+  portOrTarget: number | CodexRoutingTarget,
+  hostname?: string,
 ): { content: string; keptUserBaseUrl: boolean } {
+  if (typeof portOrTarget !== "number") {
+    return setRootOpenaiBaseUrlForTarget(content, validateCodexRoutingTarget(portOrTarget));
+  }
   const lines = content.split("\n");
   const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
   const rootEnd = firstTable === -1 ? lines.length : firstTable;
-  const key = buildOpenaiBaseUrlLine(port, hostname);
+  const key = buildOpenaiBaseUrlLine(portOrTarget, hostname);
 
   for (let i = 0; i < rootEnd; i++) {
     if (!isRootOpenaiBaseUrlLine(lines[i])) continue;
@@ -289,10 +416,73 @@ export function setRootOpenaiBaseUrl(
   return { content: lines.join("\n"), keptUserBaseUrl: false };
 }
 
+function setRootOpenaiBaseUrlForTarget(
+  content: string,
+  target: CodexRoutingTarget,
+): { content: string; keptUserBaseUrl: boolean } {
+  const lines = content.split("\n");
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const rootEnd = firstTable === -1 ? lines.length : firstTable;
+  const key = buildOpenaiBaseUrlLineForTarget(target);
+  for (let index = 0; index < rootEnd; index += 1) {
+    if (!isRootOpenaiBaseUrlLine(lines[index])) continue;
+    const markerOwned = index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER);
+    if (!markerOwned) return { content, keptUserBaseUrl: true };
+    lines[index] = key;
+    return { content: lines.join("\n"), keptUserBaseUrl: false };
+  }
+  if (firstTable === -1) {
+    return {
+      content: `${content.replace(/\n+$/, "")}\n${OCX_SECTION_MARKER}\n${key}\n`,
+      keptUserBaseUrl: false,
+    };
+  }
+  let insertAt = firstTable;
+  while (insertAt > 0 && lines[insertAt - 1].trim() === "") insertAt -= 1;
+  lines.splice(insertAt, 0, OCX_SECTION_MARKER, key);
+  return { content: lines.join("\n"), keptUserBaseUrl: false };
+}
+
+/**
+ * Companion to `setRootOpenaiBaseUrlForTarget` for the realtime sideband override. Same
+ * ownership rule, applied per key: the line is ours only when the marker sits directly
+ * above it; a user's own line (no marker above it) is kept and nothing is injected. The
+ * key gets its OWN marker line rather than sharing the routing override's, so a user line
+ * that happens to sit right under our `openai_base_url` is never mistaken for ours.
+ * Placement: directly after the marker-owned `openai_base_url` pair. Only ever called on
+ * the Design B (loopback) path right after the routing override was written — the legacy
+ * provider-table form needs the admission-token header, which the sideband cannot carry.
+ */
+export function setRootRealtimeWsBaseUrl(
+  content: string,
+  target: CodexRoutingTarget,
+): { content: string; keptUserRealtimeWsBaseUrl: boolean } {
+  const lines = content.split("\n");
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const rootEnd = firstTable === -1 ? lines.length : firstTable;
+  const key = buildRealtimeWsBaseUrlLine(validateCodexRoutingTarget(target));
+  for (let index = 0; index < rootEnd; index += 1) {
+    if (!isRootRealtimeWsBaseUrlLine(lines[index])) continue;
+    const markerOwned = index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER);
+    if (!markerOwned) return { content, keptUserRealtimeWsBaseUrl: true };
+    lines[index] = key;
+    return { content: lines.join("\n"), keptUserRealtimeWsBaseUrl: false };
+  }
+  for (let index = 0; index < rootEnd; index += 1) {
+    if (!isRootOpenaiBaseUrlLine(lines[index])) continue;
+    if (!(index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER))) continue;
+    lines.splice(index + 1, 0, OCX_SECTION_MARKER, key);
+    return { content: lines.join("\n"), keptUserRealtimeWsBaseUrl: false };
+  }
+  // No marker-owned routing override to attach to: the override has no owner, so inject nothing.
+  return { content, keptUserRealtimeWsBaseUrl: false };
+}
+
 /**
  * Remove the marker-owned root `openai_base_url` (marker line + the key line right after it).
  * A user's own root override (no marker) survives; an orphaned marker with no key line after
  * it is dropped too so repeated strip/inject cycles cannot accumulate marker comments.
+ * A marker-owned `experimental_realtime_ws_base_url` pair is removed by the same rule.
  */
 export function stripInjectedOpenaiBaseUrl(content: string): string {
   const lines = content.split("\n");
@@ -301,7 +491,7 @@ export function stripInjectedOpenaiBaseUrl(content: string): string {
   const drop = new Set<number>();
   for (let i = 0; i < rootEnd; i++) {
     if (!lines[i].includes(OCX_SECTION_MARKER)) continue;
-    if (i + 1 < rootEnd && isRootOpenaiBaseUrlLine(lines[i + 1])) {
+    if (i + 1 < rootEnd && (isRootOpenaiBaseUrlLine(lines[i + 1]) || isRootRealtimeWsBaseUrlLine(lines[i + 1]))) {
       drop.add(i);
       drop.add(i + 1);
     } else if (i + 1 >= rootEnd || lines[i + 1].trim() === "") {
@@ -619,17 +809,48 @@ function stripOpencodexCatalogPath(content: string): string {
     .join("\n");
 }
 
-export function buildProfileFile(port: number, catalogPath?: string | null, supportsWebsockets = false, includeApiAuthHeader = false, hostname?: string, fastMode?: boolean): string {
-  const host = providerBaseHost(hostname);
+export function buildProfileFile(port: number, catalogPath?: string | null, supportsWebsockets?: boolean, includeApiAuthHeader?: boolean, hostname?: string, fastMode?: boolean): string;
+export function buildProfileFile(target: CodexRoutingTarget, catalogPath?: string | null, supportsWebsockets?: boolean, fastMode?: boolean): string;
+export function buildProfileFile(
+  portOrTarget: number | CodexRoutingTarget,
+  catalogPath?: string | null,
+  supportsWebsockets = false,
+  includeApiAuthHeaderOrFastMode?: boolean,
+  hostname?: string,
+  fastMode?: boolean,
+): string {
+  const target = typeof portOrTarget === "number"
+    ? validateCodexRoutingTarget({
+        baseUrl: `http://${providerBaseHost(hostname)}:${portOrTarget}/v1`,
+        requiresAdmissionToken: includeApiAuthHeaderOrFastMode === true,
+        tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+      })
+    : validateCodexRoutingTarget(portOrTarget);
+  return buildProfileFileForTarget(
+    target,
+    catalogPath,
+    supportsWebsockets,
+    typeof portOrTarget === "number" ? fastMode : includeApiAuthHeaderOrFastMode,
+  );
+}
+
+function buildProfileFileForTarget(
+  target: CodexRoutingTarget,
+  catalogPath?: string | null,
+  supportsWebsockets = false,
+  fastMode?: boolean,
+): string {
+  const origin = routingTargetOrigin(target);
+  const host = new URL(origin).host;
   // Design B (loopback): the reference/fallback file documents the root override form.
   // Non-loopback keeps the legacy provider-table shape (built-in provider cannot carry
-  // the x-opencodex-api-key env header).
-  if (!includeApiAuthHeader) {
+  // the x-opencodex-api-key env header); explicit Desktop policies share that shape.
+  if (!usesProviderTable(target)) {
     const lines = [
       "# OpenCodex proxy fallback config (Design B)",
-      `# Root override that points Codex's built-in openai provider at the proxy on ${host}:${port}.`,
+      `# Root override that points Codex's built-in openai provider at the proxy on ${host}.`,
       "# Merge these root keys into ~/.codex/config.toml manually if auto-injection was removed.",
-      buildOpenaiBaseUrlLine(port, hostname),
+      buildOpenaiBaseUrlLineForTarget(target),
     ];
     if (catalogPath) lines.push(`model_catalog_json = ${tomlString(catalogPath)}`);
     if (fastMode !== undefined) lines.push("", "[features]", `fast_mode = ${fastMode ? "true" : "false"}`, "");
@@ -637,12 +858,12 @@ export function buildProfileFile(port: number, catalogPath?: string | null, supp
   }
   const lines = [
     "# OpenCodex proxy profile — use with: codex --profile opencodex",
-    `# Routes all model requests through the opencodex proxy at ${host}:${port}`,
+    `# Routes all model requests through the opencodex proxy at ${host}`,
     'model_provider = "opencodex"',
   ];
   if (catalogPath) lines.push(`model_catalog_json = ${tomlString(catalogPath)}`);
   if (fastMode !== undefined) lines.push("", "[features]", `fast_mode = ${fastMode ? "true" : "false"}`);
-  lines.push(buildProviderTableBlock(port, supportsWebsockets, includeApiAuthHeader, hostname).trimEnd(), "");
+  lines.push(buildProviderTableBlockForTarget(target, supportsWebsockets).trimEnd(), "");
   return lines.join("\n");
 }
 
@@ -684,8 +905,14 @@ export async function injectCodexConfig(
   //
   // The listener port is fixed in config, never OS-assigned, so this value survives restarts
   // and matches what an already-running app-server read at startup.
-  const loopback = config?.unauthenticatedLoopbackListener;
-  if (loopback?.enabled) port = loopback.port;
+  let routingTarget: CodexRoutingTarget;
+  try {
+    routingTarget = options.routingTarget
+      ? validateCodexRoutingTarget(options.routingTarget)
+      : standaloneCodexRoutingTarget(port, config);
+  } catch (error) {
+    return { success: false, message: error instanceof Error ? error.message : "Invalid Codex routing target" };
+  }
   if (!existsSync(CODEX_CONFIG_PATH)) {
     return {
       success: false,
@@ -698,7 +925,14 @@ export async function injectCodexConfig(
   if (activeProvider) {
     // A launcher may have journaled before the provider manager took ownership. Never let shutdown
     // replay that stale snapshot over externally managed config.
-    if (!options.validateOnly) removeJournal();
+    if (!options.validateOnly) {
+      if (options.beforeClientWrite) {
+        withConfigMutationLockSync(() => {
+          runClientWriteGuard(options.beforeClientWrite);
+          removeJournal();
+        });
+      } else removeJournal();
+    }
     const nativeSubagentDefaultsWarning = configuredManagedSubagentDefaults(
       config,
     )
@@ -712,8 +946,8 @@ export async function injectCodexConfig(
       message:
         `⚠️ Codex routing NOT injected: config.toml selects the external model_provider ${tomlString(activeProvider)}.\n` +
         `  OpenCodex preserves external provider configuration so existing ${tomlString(activeProvider)} session history stays visible.\n` +
-        `  Configure that provider for Responses passthrough at http://${providerBaseHost(config?.hostname)}:${port}/v1` +
-        `${shouldInjectApiAuthHeader(config) ? ` with x-opencodex-api-key from OPENCODEX_API_AUTH_TOKEN` : ""}.\n` +
+        `  Configure that provider for Responses passthrough at ${routingTarget.baseUrl}` +
+        `${routingTarget.requiresAdmissionToken ? ` with x-opencodex-api-key from ${routingTarget.tokenEnv}` : ""}.\n` +
         `  For direct injection, switch to the built-in openai provider, remove any user-owned root openai_base_url, and rerun 'ocx start'.`,
     };
   }
@@ -764,6 +998,16 @@ export async function injectCodexConfig(
   // Design B form FIRST: removeOcxSection also keys on the marker line, so a root-level
   // marker + openai_base_url pair must be gone before it scans or it would swallow root keys.
   content = stripInjectedOpenaiBaseUrl(content);
+  // #1798: after a Codex app rewrite the markers are gone but the values we recorded writing
+  // are still ours. Consume them by value here, BEFORE the routing form is chosen, so a
+  // Design B -> provider-table transition (hostname change, authless opt-in) cannot leave our
+  // own root URLs behind as if they were the user's, and so re-inject never journals them as
+  // not-ours (which would make them unrestorable).
+  content = stripJournaledOpenaiBaseUrl(
+    content,
+    journaledInjectedOpenaiBaseUrl({ readOnly: !!options.beforeClientWrite }),
+    journaledInjectedRealtimeWsBaseUrl({ readOnly: !!options.beforeClientWrite }),
+  );
   if (hasOcxProviderTable(content)) {
     content = removeOcxSection(content);
   }
@@ -781,30 +1025,70 @@ export async function injectCodexConfig(
     ? setRootModelCatalogPath(content, catalogPath)
     : stripOpencodexCatalogPath(content);
 
-  const legacyMode = shouldInjectApiAuthHeader(config);
+  // Provider-table form: non-loopback admission or an explicit Desktop policy.
+  const providerTableMode = usesProviderTable(routingTarget);
+  // Client compaction is the one table form that must not orphan existing threads. It changes
+  // the DEFAULT provider to `opencodex`, but a thread already tagged `openai` keeps resolving
+  // to Codex's built-in entry, and without the root override that entry is api.openai.com —
+  // the thread would resume outside this proxy and outside configured routing. Keeping the
+  // marker-owned root override alongside the table fixes that at the source: codex builds its
+  // provider map as merge_configured_model_providers(built_in_model_providers(openai_base_url),
+  // model_providers), so the override lands on the built-in `openai` entry when the map is
+  // built, independent of which id is the default, and the merge leaves that entry alone for
+  // every id except the two Amazon Bedrock ones. With the managed override in place both
+  // entries point at this proxy. That is a guarantee about the line we own: when the user owns
+  // the root line we inject nothing, and the built-in entry keeps whatever destination they
+  // chose, so an `openai`-tagged thread follows their configuration rather than this proxy.
+  //
+  // Re-tagging history was the alternative and it cannot be made durable: the length-preserving
+  // first-line repair cannot grow "openai" into "opencodex" without pre-existing padding, and
+  // codex re-appends that stale first line whenever it writes git or memory-mode metadata.
+  //
+  // Authless is excluded on purpose: its whole point is a provider that carries
+  // requires_openai_auth = false, and admission-token forms cannot use the root key at all.
+  // Those two forms therefore keep their existing behaviour, forward-tagging resume history with
+  // originals backed up, and that includes the case where a user enables authless and client
+  // compaction together. Only the compaction-only form skips the history unit.
+  const keepRootOverrideAlongsideTable = providerTableMode
+    && routingTarget.clientCompaction === true
+    && routingTarget.desktopAuthless !== true
+    && routingTarget.requiresAdmissionToken !== true;
   let keptUserBaseUrl = false;
-  if (legacyMode) {
+  let keptUserRealtimeWsBaseUrl = false;
+  if (providerTableMode) {
     // Legacy (non-loopback) injection: the built-in openai provider cannot carry the
     // x-opencodex-api-key env header, so keep the opencodex provider table + root re-tag.
+    // The authless opt-in needs the same table because only a dedicated provider can carry
+    // requires_openai_auth = false.
     // 1) Root key BEFORE the first table header (must be a global, not nested under a table).
     content = setRootModelProvider(content);
     // 2) Provider table appended at EOF (position-independent).
     content =
       content.trimEnd() +
       "\n" +
-      buildProviderTableBlock(
-        port,
-        websocketsEnabled(config ?? {}),
-        true,
-        config?.hostname,
-      );
+      buildProviderTableBlockForTarget(routingTarget, websocketsEnabled(config ?? {}));
+    // 3) Keep existing `openai`-tagged threads reaching the proxy (see above). Ownership rules
+    // are the Design B ones: a user's own root line is never replaced.
+    if (keepRootOverrideAlongsideTable) {
+      content = stripInjectedOpenaiBaseUrl(content);
+      const rootFallback = setRootOpenaiBaseUrlForTarget(content, routingTarget);
+      content = rootFallback.content;
+      keptUserBaseUrl = rootFallback.keptUserBaseUrl;
+    }
   } else {
     // Design B (loopback): a single root override; codex keeps its native `openai` provider id
     // so thread history is never remapped. Any legacy form was already stripped above.
     content = stripInjectedOpenaiBaseUrl(content); // normalize before idempotent re-insert
-    const result = setRootOpenaiBaseUrl(content, port, config?.hostname);
+    const result = setRootOpenaiBaseUrlForTarget(content, routingTarget);
     content = result.content;
     keptUserBaseUrl = result.keptUserBaseUrl;
+    // Voice sideband override rides on the routing override: same value, same ownership rule,
+    // and never when the user owns the routing line (we inject nothing in that case).
+    if (!keptUserBaseUrl) {
+      const realtime = setRootRealtimeWsBaseUrl(content, routingTarget);
+      content = realtime.content;
+      keptUserRealtimeWsBaseUrl = realtime.keptUserRealtimeWsBaseUrl;
+    }
   }
 
   const desiredSubagentDefaults = configuredManagedSubagentDefaults(config);
@@ -838,7 +1122,12 @@ export async function injectCodexConfig(
     managedDefaultsMessage = `  ⚠️ ${nativeSubagentDefaultsWarning}\n`;
   }
 
-  const profileContent = buildProfileFile(port, catalogPath, websocketsEnabled(config ?? {}), legacyMode, config?.hostname, config?.fastMode);
+  const profileContent = buildProfileFileForTarget(
+    routingTarget,
+    catalogPath,
+    websocketsEnabled(config ?? {}),
+    config?.fastMode,
+  );
   content = applyEol(content, eol);
 
   /*
@@ -905,6 +1194,24 @@ export async function injectCodexConfig(
     };
   }
 
+  const journalBaselineIsNative = (): boolean => {
+    // Value evidence survives an app rewrite that removes the ownership comments.
+    const journaledBaseUrl = journaledInjectedOpenaiBaseUrl({ readOnly: true });
+    const journaledRealtimeWsBaseUrl = journaledInjectedRealtimeWsBaseUrl({ readOnly: true });
+    const looksInjectedByValue =
+      (journaledBaseUrl !== null && rootTomlString(rawContent, "openai_base_url") === journaledBaseUrl)
+      || (journaledRealtimeWsBaseUrl !== null
+        && rootTomlString(rawContent, REALTIME_WS_BASE_URL_KEY) === journaledRealtimeWsBaseUrl);
+    return !hasInjectedCodexRouting(rawContent) && !looksInjectedByValue;
+  };
+  const readCurrentProfile = (): string | null => existsSync(CODEX_PROFILE_PATH)
+    ? readFileSync(CODEX_PROFILE_PATH, "utf-8")
+    : null;
+  const unverifiedJournalMessage = "Codex configuration was not written: the journal has no verified baseline for the current config/profile. Current files and the journal were preserved.";
+  if (!journalBaselineIsNative() && hasUnverifiedJournalBaseline(baselineContent, readCurrentProfile())) {
+    return { success: false, message: unverifiedJournalMessage };
+  }
+
   if (options.validateOnly) {
     return {
       success: true,
@@ -914,16 +1221,30 @@ export async function injectCodexConfig(
 
   const applyNativeArtifacts = (): void => {
     writeJournal({
-      currentStateIsNative: !hasInjectedCodexRouting(rawContent),
+      currentStateIsNative: journalBaselineIsNative(),
       configContent: baselineContent,
+      owner: options.journalOwner,
     });
+    // A native snapshot may have been refreshed above. An older hashless routed snapshot
+    // must not gain the new injection's hash and later overwrite preserved user edits.
+    if (hasUnverifiedJournalBaseline(baselineContent, readCurrentProfile())) throw new Error(unverifiedJournalMessage);
     atomicWriteFile(CODEX_CONFIG_PATH, content);
     atomicWriteFile(CODEX_PROFILE_PATH, profileContent);
     markJournalInjectedState(content, profileContent, {
-      // A root override is ours only in loopback Design B when no user-owned value won.
-      injectedOpenaiBaseUrl: legacyMode || keptUserBaseUrl
+      // A root override is ours whenever we wrote one and no user-owned value won. That is
+      // loopback Design B, and now also the client-compaction form, which keeps the same
+      // marker-owned root line beside its provider table. Journaling it matters because the
+      // marker comment is not durable: the Codex app can reserialize config.toml and drop
+      // comments, and restore then has only the journaled value to tell our line from a user's
+      // (#1798). The other table forms never write the key, so they still record null.
+      injectedOpenaiBaseUrl: (providerTableMode && !keepRootOverrideAlongsideTable) || keptUserBaseUrl
         ? null
         : rootTomlString(content, "openai_base_url"),
+      // The sideband override is ours only when we wrote it this pass (never in legacy mode,
+      // never when the user owns either key).
+      injectedRealtimeWsBaseUrl: providerTableMode || keptUserBaseUrl || keptUserRealtimeWsBaseUrl
+        ? null
+        : rootTomlString(content, REALTIME_WS_BASE_URL_KEY),
       // This is the catalog artifact selected for this injection, even when config.toml
       // already points at that path and therefore needs no textual rewrite.
       injectedCatalogPath: catalogPath,
@@ -939,17 +1260,24 @@ export async function injectCodexConfig(
   let transitionReceipt: { nativeGeneration: number; currentTxId: string } | undefined;
 
   if (eligibility.kind === "legacy-uncoordinated") {
-    // Unchanged behavior for homes the coordinator cannot yet adopt. Stated
-    // rather than implied: this is the boundary, and adoption is its own phase.
-    if (!shouldSyncCodexOnStart(loadConfig())) {
-      return {
-        success: true,
-        status: "skipped",
-        skippedReason: "desired_disabled",
-        message: "Codex integration is OFF; no Codex config, catalog, cache, or history was changed.",
-      };
-    }
-    applyNativeArtifacts();
+    const applyLegacy = (): CodexInjectResult | undefined => {
+      if (!shouldSyncCodexOnStart(loadConfig())) {
+        return {
+          success: true,
+          status: "skipped",
+          skippedReason: "desired_disabled",
+          message: "Codex integration is OFF; no Codex config, catalog, cache, or history was changed.",
+        };
+      }
+      runClientWriteGuard(options.beforeClientWrite);
+      applyNativeArtifacts();
+    };
+    // Only connected guarded writes add C here. A concurrent disconnect claim
+    // either follows this commit or is observed by the guard before any write.
+    const skipped = options.beforeClientWrite
+      ? withConfigMutationLockSync(applyLegacy)
+      : applyLegacy();
+    if (skipped) return skipped;
   } else {
     const coordinated = await withCodexWriteLock(
       {
@@ -970,6 +1298,10 @@ export async function injectCodexConfig(
         if (!shouldSyncCodexOnStart(loadConfig())) {
           throw new CodexWriteLockSkipped("desired_disabled");
         }
+        // N and C are held here. Reject stale client work before publishing a
+        // transition or capturing preimages; rejection must not compensate over
+        // a disconnect's restored files.
+        runClientWriteGuard(options.beforeClientWrite);
         /*
          * Publish BEFORE touching the filesystem. `assertPublished` runs after this
          * callback returns and throws unless a transition was recorded, so writing
@@ -1047,7 +1379,11 @@ export async function injectCodexConfig(
   }
   // Legacy mode still forward-tags history so re-tagged threads stay listable. Design B needs
   // the opposite: a one-time migration of previously re-tagged threads BACK to openai (restore
-  // machinery; cheap no-op when there is nothing to migrate).
+  // machinery; cheap no-op when there is nothing to migrate). The client-compaction opt-in keeps
+  // the root override alongside its table precisely so it does NOT have to touch history: an
+  // existing `openai`-tagged thread still reaches this proxy through the built-in entry. So it
+  // skips this unit, and future-only means what it says — no provider metadata is rewritten and
+  // no `ocx1:` payload is touched.
   // History runs in a Worker under H, not on this thread.
   //
   // The three surfaces it touches — the SQLite rows, the backup manifest, and the
@@ -1060,8 +1396,8 @@ export async function injectCodexConfig(
     expectedDesiredEnabled: true,
     operation: deriveCodexHistoryOperation({
       direction: "apply",
-      resumeHistory: config?.syncResumeHistory !== false,
-      legacyMode,
+      resumeHistory: config?.syncResumeHistory !== false && !keepRootOverrideAlongsideTable,
+      legacyMode: providerTableMode,
     }),
   });
   // A blocked or failed unit is reported, not silently counted as zero work:
@@ -1092,17 +1428,42 @@ export async function injectCodexConfig(
   const ejected = (history as { ejectedRows?: number }).ejectedRows ?? 0;
   const migratedRows = (history.rows ?? 0) + ejected;
   const historyMessage =
-    config?.syncResumeHistory === false
+    keepRootOverrideAlongsideTable
+      ? (keptUserBaseUrl
+        ? `  Codex resume history: left unchanged; threads already tagged openai follow your configured root openai_base_url.\n`
+        : `  Codex resume history: left unchanged; existing threads keep reaching the proxy through the retained openai_base_url override.\n`)
+      : config?.syncResumeHistory === false
       ? `  Codex resume history: left unchanged (syncResumeHistory=false).\n`
       : history.failed
-        ? formatApplyHistoryFailure(historyOutcome, legacyMode)
-        : legacyMode
+        ? formatApplyHistoryFailure(historyOutcome, providerTableMode)
+        : providerTableMode
           ? `  Codex resume history: ${history.rows} thread(s) made visible for opencodex; originals backed up for restore.\n`
           : migratedRows > 0
             ? `  Codex resume history: restored original provider metadata for ${migratedRows} manifest-backed thread(s) (one-time).\n`
             : `  Codex resume history: no backed-up metadata pending; untracked routed history left unchanged.\n`;
-  // A user-owned root openai_base_url means we did NOT install routing — say so honestly
+  // A user-owned root openai_base_url means we did NOT install root routing — say so honestly
   // instead of claiming the proxy route is active (catalog/fast_mode were still written).
+  //
+  // The client-compaction form writes a provider table as well, so "nothing was injected" would
+  // misdescribe the file it just produced: new threads do use the injected table. Report that
+  // mixed result on its own terms, and never tell the operator to delete a setting of theirs.
+  // Ownership alone says nothing about destination: their line may already target this proxy.
+  if (keptUserBaseUrl && keepRootOverrideAlongsideTable) {
+    return {
+      success: true,
+      ...(nativeSubagentDefaultsWarning ? { nativeSubagentDefaultsWarning } : {}),
+      message:
+        `Injected opencodex as default provider into Codex config (client-side compaction mode; ChatGPT auth remains required).\n` +
+        `  Your root openai_base_url was left exactly as you set it, so opencodex did not add its own.\n` +
+        catalogMessage +
+        historyMessage +
+        managedDefaultsMessage +
+        `  New threads use the injected opencodex provider and route through the proxy.\n` +
+        `  Threads already tagged openai resolve through Codex's built-in provider, which your root openai_base_url points at.\n` +
+        `  No root URL change is required to enable client-side compaction for new threads.\n` +
+        `  Fallback: codex --profile opencodex (same behavior)`,
+    };
+  }
   if (keptUserBaseUrl) {
     return {
       success: true,
@@ -1118,9 +1479,13 @@ export async function injectCodexConfig(
         `  Reference config: ${CODEX_PROFILE_PATH}`,
     };
   }
-  const headline = legacyMode
-    ? `Injected opencodex as default provider into Codex config.\n`
-    : `Pointed Codex's built-in openai provider at the opencodex proxy (openai_base_url).\n`;
+  const headline = routingTarget.desktopAuthless === true
+    ? `Injected opencodex as default provider into Codex config (authless Desktop mode: requires_openai_auth = false).\n`
+    : routingTarget.clientCompaction === true
+      ? `Injected opencodex as default provider into Codex config (client-side compaction mode; ChatGPT auth remains required).\n`
+    : providerTableMode
+      ? `Injected opencodex as default provider into Codex config.\n`
+      : `Pointed Codex's built-in openai provider at the opencodex proxy (openai_base_url + realtime sideband override).\n`;
   return {
     success: true,
     ...(nativeSubagentDefaultsWarning ? { nativeSubagentDefaultsWarning } : {}),
@@ -1132,7 +1497,7 @@ export async function injectCodexConfig(
       `  All models now route through opencodex proxy (like OpenRouter).\n` +
       `  OpenAI models (gpt-5.5, etc.) are passed through to OpenAI.\n` +
       `  Custom models route to their configured providers.\n` +
-      (legacyMode
+      (providerTableMode
         ? `  Fallback: codex --profile opencodex (same behavior)`
         : `  Fallback reference: ${CODEX_PROFILE_PATH}`),
   };
@@ -1207,6 +1572,7 @@ interface StripOpencodexConfigResult {
 function stripOpencodexConfigResult(
   content: string,
   journaledBaseUrl: string | null = null,
+  journaledRealtimeWsBaseUrl: string | null = null,
 ): StripOpencodexConfigResult {
   let out = content;
   const hadRootOcxProvider =
@@ -1217,7 +1583,7 @@ function stripOpencodexConfigResult(
   const hadInjectedBaseUrl = hasInjectedOpenaiBaseUrl(out)
     || (journaledBaseUrl !== null && rootTomlString(out, "openai_base_url") === journaledBaseUrl);
   out = stripInjectedOpenaiBaseUrl(out); // before removeOcxSection — it keys on the marker line too
-  out = stripJournaledOpenaiBaseUrl(out, journaledBaseUrl);
+  out = stripJournaledOpenaiBaseUrl(out, journaledBaseUrl, journaledRealtimeWsBaseUrl);
   if (hasOcxProviderTable(out)) {
     out = removeOcxSection(out);
   }
@@ -1272,9 +1638,12 @@ export function removeCodexConfig(
   // Read the recorded injection once: the strip below consumes it, and so does the
   // ownership verdict, which must agree with what was actually removed.
   const journaledBaseUrl = journaledInjectedOpenaiBaseUrl();
+  const journaledRealtimeWsBaseUrl = journaledInjectedRealtimeWsBaseUrl();
   const had = hasOpencodexRouting(content)
-    || (journaledBaseUrl !== null && rootTomlString(content, "openai_base_url") === journaledBaseUrl);
-  const stripped = stripOpencodexConfigResult(content, journaledBaseUrl);
+    || (journaledBaseUrl !== null && rootTomlString(content, "openai_base_url") === journaledBaseUrl)
+    || (journaledRealtimeWsBaseUrl !== null
+      && rootTomlString(content, REALTIME_WS_BASE_URL_KEY) === journaledRealtimeWsBaseUrl);
+  const stripped = stripOpencodexConfigResult(content, journaledBaseUrl, journaledRealtimeWsBaseUrl);
   if (had || stripped.content !== content) {
     atomicWriteFile(CODEX_CONFIG_PATH, applyEol(stripped.content, eol));
   }
@@ -1456,6 +1825,12 @@ export function skippedRestoreEnvelope(success: boolean, message: string): Codex
 function restoreCodexConfigInline(): CodexRestoreConfigResult {
   try {
     const journal = restoreJournalState();
+    if (journal.unverified) {
+      return {
+        state: "failed", changed: false, action: "failed",
+        message: "Codex journal recovery was not verified; current configuration files and the journal were preserved.",
+      };
+    }
     const restored = journal.configRestored
       ? { success: true, message: "Codex config restored from opencodex journal." }
       : removeCodexConfig({ preserveProfile: journal.profileRestored || journal.profileChanged });

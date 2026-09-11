@@ -53,6 +53,10 @@ ocx eject back
 
 これは広範囲で破壊的な再ラベル付けです。ユーザーメッセージを持ち、現在 `opencodex` とタグ付けされているすべてのスレッドを `openai` に変更し、`exec` を `cli` に正規化してイベントマーカーを設定します。正当な専用プロバイダー履歴も対象です。状態をバックアップし、この全範囲を意図する場合にのみ実行してください。
 
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+ルーティングされたプロバイダーで圧縮されたタスクをネイティブ Codex で再開する前に、その履歴を修復します。このコマンドは UUID で 1 つのタスクだけを選択し、非公開のバイト単位バックアップを保存してから、OpenCodeX 所有の `ocx1:` 圧縮状態だけをネイティブ Codex が再生できる通常の要約に変換します。ネイティブの暗号化コンテンツと他のタスクは変更しません。実行前に対象タスクを閉じてください。処理中に rollout が変更された場合、ファイルを置き換えずに修復を中止します。
+
 ### `ocx uninstall`・`ocx remove`
 
 すべての復元手順が成功した場合にのみ、サービスとプロキシを停止し、サービスと Codex シムを削除し、ネイティブ Codex を復元してから、opencodex ローカル設定を削除します。 `remove` は `uninstall` の別名です。設定のクリーンアップには、新規インストールによって作成された所有権メタデータが必要です。従来のディレクトリまたは共有ディレクトリはそのまま残ります。
@@ -123,7 +127,7 @@ ocx status --json
 
 認証不要の `GET /readyz` エンドポイントで同期後の準備状態を確認します。準備完了時は `200`、
 `pending` または終端状態の `failed` では `Retry-After: 1` とともに `503` を返します。HTTP の
-サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status}` です。`/readyz` がない
+サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}` です。`protocol` は hub の現在の remote protocol、`minimumClientProtocol` は互換性のある最小 client protocol、`managementUrl` は browser から見える canonical management origin です。`/readyz` がない
 旧プロキシは `unreachable` として fail-closed し、`/healthz` は readiness ではなく別の liveness 確認です。
 デフォルトでは 1 回だけ probe します。`--wait` は準備完了または timeout まで polling しますが、
 終端 `failed` を確認すると即座に終了します。デフォルト timeout は 45 秒で、`--timeout <seconds>` には
@@ -155,6 +159,12 @@ Codex のローカル モデル ピッカー キャッシュを無効にし、�
 ### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 opencodex を、ログイン時に自動起動し、クラッシュ時に自動再起動するログイン管理バックグラウンド サービス (macOS **launchd**、Linux **systemd ユーザー ユニット**、Windows **タスク スケジューラ**) として実行します。サービスは `OCX_SERVICE=1` を設定して実行されるため、再起動によって Codex 設定が変更されることはありません。
+
+Windows タスク スケジューラでインストールするサービスは、通常のプロセス優先度（`Priority=4`）を使用します。
+以前のバックグラウンド優先度（`7`。省略時もスケジューラの既定値は `7`）では、CPU の競合により
+ヘルスチェックへの応答が遅れ、プロセスが動作中でもトレイに Offline と表示されることがあります。
+アップグレード後に `ocx service repair` を実行すると、この登録済み優先度を移行してサービスを再起動します。
+移行時に UAC の承認が必要になる場合があります。すでに通常または高優先度の場合、優先度だけを理由に再登録しません。
 
 |サブコマンド |アクション |
 | --- | --- |
@@ -206,9 +216,27 @@ ocx codex-shim status
 ocx codex-shim uninstall
 ```
 
+:::note[Windows のトークン環境]
+新しく生成される Windows CMD と PowerShell のシムは、実行後に呼び出し元の `OPENCODEX_API_AUTH_TOKEN` を元の状態に戻します。Codex とその子プロセスには、引き続きトークンが継承される可能性があります。
+
+OpenCodex の更新後、既存の Windows シムにこの動作を適用するには、`ocx codex-shim uninstall`、続いて `ocx codex-shim install` を実行して再作成してください。通常の更新では、正常な Windows シムは書き換えられません。
+:::
+
 :::tip[サービス vs シム]
 常時オンのバックグラウンド プロキシには `ocx service` を使用します (推奨)。デーモンを使用しない軽量のオンデマンド起動には、`ocx codex-shim` を使用します。プロキシは、`codex` が起動された場合にのみ起動します。
 :::
+
+#### Codex へのトークン注入
+
+非ループバックアドレスにバインドする場合、注入されるプロバイダーには `env_key = "OPENCODEX_API_AUTH_TOKEN"` が含まれます。この行は、読み取る変数を Codex に指定するだけで、変数を作成するものではありません。変数が存在しない場合、Codex はリクエストの開始を拒否し（`Missing environment variable: OPENCODEX_API_AUTH_TOKEN`）、プロキシには到達しません。値は `$OPENCODEX_HOME/service-api-token` に保存されており、起動元のプロセスが Codex の環境にその値を渡す必要があります。
+
+`ocx codex-shim install` でインストールされる、保守対象のシムを使用してください。起動コンテキストでこのシムが選択されると、シムは OpenCodex が作成したトークンファイルを読み取り、変数を Codex に渡します。デスクトップ、cron、サービスから起動する場合は、このシムが選択される PATH またはランチャーパスを使用する必要があります。インストールによって、それらの環境が自動的に設定されるわけではありません。Codex 自身の子プロセスにも、トークンが継承される可能性があります。
+
+この Bearer トークンをシェルの起動ファイルからエクスポートしたり、`config.toml` にコピーしたりしないでください。`service-api-token` ファイルに含まれるのは `NAME=value` 形式の代入ではなくトークンそのものなので、systemd の `EnvironmentFile=` として直接使用することはできません。
+
+`opencodex-proxy.service` の `EnvironmentFile=` または `OCX_API_TOKEN_FILE` は、プロキシプロセスだけを設定するものであり、独立して起動された `codex exec` に渡されることはありません。
+
+ランチャーを置き換える Codex のアップグレードによって、シムは削除されます。次に通常の `ocx` コマンドを実行すると復元されますが（上記参照）、その前に実行された `codex exec` は失敗します。`ocx doctor` は、この状態（env_key が設定済み、変数が未設定、シムが存在しないか正常でない、トークンファイルは存在する）を修復コマンドとともに "Codex env_key launch readiness" の項目で報告し、トークンを表示することはありません。トークンファイルの読み取りは、注入された `env_key` の契約には含まれません。起動元のプロセスがその変数を渡す必要があります。
 
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
@@ -234,3 +262,7 @@ ocx update --tag preview
 ```
 
 新しいバージョンは、[リリースワークフロー](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) が npm に公開すると利用可能になります。
+
+## Remote Hub クライアントのライフサイクル
+
+`ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync`、`ocx connect rotate --pairing-code-stdin` を使います。`ocx disconnect` はオフラインでローカル状態を復元しますが hub のキーは失効させません。接続中は `ocx connect revoke --admin-token-stdin` が保存済み `apiKeyId` を失効させ、切断後は hub の **Integrations → API Keys** を使います。秘密値は stdin だけで渡し、argv には入れません。

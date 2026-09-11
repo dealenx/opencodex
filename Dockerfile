@@ -1,69 +1,60 @@
-# opencodex proxy in a container: Bun runtime + GUI dashboard built during image build.
-# Stage 1 runs the repo's own `bun run build:gui` (gui install -> tsc -b && vite build
-# -> prepare:package), stage 2 runs the proxy with the built dashboard in place.
-FROM oven/bun:1.4.0-slim AS build
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
-# Deps first for layer caching: root (production) + gui (build toolchain).
-COPY package.json bun.lock ./
-COPY gui/package.json gui/bun.lock ./gui/
-RUN bun install --frozen-lockfile --production \
-    && cd gui && bun install --frozen-lockfile
+# Keep the runtime aligned with package.json and pin the multi-platform image index.
+ARG BUN_IMAGE=oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
 
-# Source needed by build:gui and by the proxy at runtime.
-COPY bin ./bin
-COPY src ./src
-COPY scripts ./scripts
-COPY gui ./gui
+FROM ${BUN_IMAGE} AS build
+WORKDIR /home/bun/app
 
-# Minimal git shim for scripts/prepare-package.ts: it hashes the working tree through
-# `git ls-files -z -- <path>...`, and a Docker build context has no .git (history must
-# not enter the image). The shim expands directories to files and prints existing files
-# NUL-separated; hashes are computed from real bytes, so the generated compatibility
-# manifest (src/generated/compatibility-version.json, untracked metadata) stays accurate.
-# The generated file is REMOVED before copying to the runtime stage: the proxy treats its
-# presence as "running from a packaged install" and skips its own manifest regeneration.
-RUN mkdir -p /usr/local/bin && printf '%s\n' \
-    '#!/bin/sh' \
-    'if [ "$1" = "ls-files" ]; then' \
-    '  shift 3 2>/dev/null || shift $#' \
-    '  for p in "$@"; do' \
-    '    if [ -d "$p" ]; then find "$p" -type f -print0' \
-    '    elif [ -f "$p" ]; then printf "%s\0" "$p"' \
-    '    fi' \
-    '  done' \
-    '  exit 0' \
-    'fi' \
-    'exec /bin/true' \
-    > /usr/local/bin/git && chmod +x /usr/local/bin/git
+# Inspect the read-only context before COPY can dereference a source symlink.
+COPY docker/verify-compatibility.ts /tmp/verify-compatibility.ts
+RUN --mount=type=bind,target=/build-context bun /tmp/verify-compatibility.ts /build-context
 
-# The repo's canonical GUI build: tsc -b && vite build -> gui/dist, then prepare:package
-# (normalizes file modes, writes the compatibility version manifest).
-RUN bun run build:gui
+COPY --chown=bun:bun package.json bun.lock tsconfig.json ./
+RUN bun install --frozen-lockfile
 
-FROM oven/bun:1.4.0-slim AS runtime
+COPY --chown=bun:bun gui/package.json gui/bun.lock ./gui/
+RUN cd gui && bun install --frozen-lockfile
 
-WORKDIR /app
+COPY --chown=bun:bun src ./src
+COPY --chown=bun:bun scripts/model-metadata.source.json ./scripts/model-metadata.source.json
+COPY --chown=bun:bun docker ./docker
+COPY --chown=bun:bun gui ./gui
+RUN cd gui && bun run build
+
+FROM ${BUN_IMAGE} AS runtime
+WORKDIR /home/bun/app
+
+# Docker supervises this foreground process; retain routed state on stop/recreate.
+# This uses the existing service lifecycle mode and does not install a service manager.
 ENV NODE_ENV=production \
-    OPENCODEX_HOME=/data \
-    PORT=10100
+    OCX_SERVICE=1 \
+    OPENCODEX_HOME=/home/bun/.opencodex \
+    CODEX_HOME=/home/bun/.codex \
+    OCX_API_TOKEN_FILE=/home/bun/.opencodex/service-api-token
 
-# Runtime deps, built GUI, and runnable source from the build stage.
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/bin ./bin
-COPY --from=build /app/src ./src
-COPY --from=build /app/scripts ./scripts
-COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/gui/dist ./gui/dist
+# These homes have incompatible auth.json formats; persist them without combining them.
+RUN install -d -m 0700 -o bun -g bun /home/bun/.opencodex /home/bun/.codex
+COPY --chown=bun:bun --chmod=0600 docker/config.json /home/bun/.opencodex/config.json
 
-VOLUME ["/data"]
+COPY --from=build --chown=bun:bun /home/bun/app/package.json ./package.json
+COPY --from=build --chown=bun:bun /home/bun/app/bun.lock ./bun.lock
+COPY --from=build --chown=bun:bun /home/bun/app/node_modules ./node_modules
+COPY --from=build --chown=bun:bun /home/bun/app/src ./src
+COPY --from=build --chown=bun:bun /home/bun/app/scripts/model-metadata.source.json ./scripts/model-metadata.source.json
+# Run `bun scripts/generate-compatibility-version.ts` on the host before building.
+# Explicit COPY makes a missing artifact a build failure; .git stays outside the context.
+COPY --chown=bun:bun src/generated/compatibility-version.json ./src/generated/compatibility-version.json
+COPY --from=build --chown=bun:bun /home/bun/app/docker ./docker
+COPY --from=build --chown=bun:bun /home/bun/app/gui/dist ./gui/dist
 
-# Bind: config.json "hostname" must be "0.0.0.0" for containers (loopback default would
-# be unreachable through the platform proxy). PORT is Railway-injected; Dokploy/free
-# deployments can pass --port directly in the command.
+USER bun
+RUN ["bun", "docker/verify-compatibility.ts"]
+RUN ["bun", "-e", "import { readOpenCodexCompatibilityVersion } from './src/routing/compatibility/version.ts'; if (!/^[0-9a-f]{64}$/.test(readOpenCodexCompatibilityVersion() ?? '')) throw new Error('Missing or invalid generated compatibility manifest');"]
+VOLUME ["/home/bun/.opencodex", "/home/bun/.codex"]
 EXPOSE 10100
 
-# Foreground process with graceful SIGTERM drain (handlers live in src/cli/index.ts).
-# Seed the volume with the image's build provenance so GET /build-info.json reports the
-# running image even after volume restorage. The proxy prefers $OPENCODEX_HOME's copy.
-CMD ["sh", "-c", "cp -n /app/gui/dist/build-info.json /data/build-info.json 2>/dev/null; exec bun run src/cli/index.ts start"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["bun", "-e", "const r=await fetch('http://127.0.0.1:10100/healthz');if(!r.ok)process.exit(1)"]
+
+CMD ["bun", "run", "src/cli/index.ts", "start", "--port", "10100"]

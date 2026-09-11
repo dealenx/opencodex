@@ -10,9 +10,12 @@ import { isMainAccountIdentityGenerationLive } from "../codex/main-account-cache
 import { MAIN_CODEX_ACCOUNT_ID } from "../codex/main-account";
 import { codexPlanKey } from "../codex/plan";
 import { resolveEnvValue } from "../config";
+import { resolveProviderApiKey } from "./key-store";
 import { getValidAccessToken, getValidAccessTokenForAccount } from "../oauth";
 import { getAccountCredential, getAccountSet, getCredential } from "../oauth/store";
 import { antigravityUserAgent } from "../adapters/client-fingerprint";
+import { isCanonicalOllamaCloudUrl } from "../adapters/ollama-native-url";
+import { providerOutboundPost, providerRedirectError, type ProviderOutboundDependencies } from "../lib/provider-outbound";
 import { apiKeyPoolEntryId } from "./api-keys";
 import { XAI_GROK_CLIENT_VERSION, XAI_GROK_COMPATIBILITY } from "./xai-transport";
 import { getProviderRegistryEntry, providerCodexAccountMode, registryEntryForProviderDestination } from "./registry";
@@ -45,6 +48,7 @@ import {
   type CodexCapacityQuota,
 } from "./codex-capacity";
 import type {
+  AccountQuotaMode,
   ProviderQuota,
   ProviderQuotaCreditsUsd,
   ProviderQuotaWindow,
@@ -62,6 +66,7 @@ import {
   readPersistedAccountQuotas,
   schedulePersistAccountQuotas,
 } from "./account-quota-disk";
+import { clearProviderApiKeyQuotaCache, mapQuotaRoster, readProviderApiKeyQuotas, type ProviderApiKeyQuota } from "./quota-key-accounts";
 
 export type { ProviderQuota, ProviderQuotaCreditsUsd, ProviderQuotaWindow } from "./quota-types";
 
@@ -97,6 +102,7 @@ const XAI_CREDITS_URL = `${XAI_BILLING_URL}?format=credits`;
 /** Keep a failed probe's previous row at most this long before dropping it. */
 const LAST_GOOD_MAX_AGE_MS = CODEX_CAPACITY_MAX_QUOTA_AGE_MS;
 const nativeMainReportGenerations = new WeakMap<ProviderQuotaReport, number>();
+const accountReportCurrent = new WeakMap<ProviderQuotaReport, () => boolean>();
 let providerQuotaBeforePublishForTests: (() => void | Promise<void>) | null = null;
 
 /** Test-only seam for identity/config invalidation after probes but before publication. */
@@ -131,6 +137,18 @@ export interface ProviderQuotaReport {
   quota: ProviderQuota;
   updatedAt: number;
   reverseEngineered?: boolean;
+  /**
+   * The row was OBSERVED in-band on a streaming turn rather than probed.
+   *
+   * Age means something different for these. A probed provider re-reads on its own TTL,
+   * so a row older than the last-good bound means the probe is failing and showing it
+   * would misrepresent a live number. A passive provider publishes no endpoint at all
+   * (`hasPassiveAccountQuota`), so its last observation is not a stale reading of
+   * something fresher — it is the only measurement that exists, and dropping it leaves
+   * the operator with nothing. Consumers that enforce a freshness bound must exempt
+   * these and state the observation age instead.
+   */
+  observed?: boolean;
   aggregation?: CodexCapacityAggregation;
 }
 
@@ -148,6 +166,7 @@ let invalidationEpoch = 0;
 export function clearProviderQuotaCache(): void {
   cache = null;
   clearCachedProviderQuotas();
+  clearProviderApiKeyQuotaCache();
   invalidationEpoch += 1;
 }
 
@@ -155,7 +174,7 @@ function cacheKey(config: OcxConfig): string {
   const providers = Object.entries(config.providers)
     .map(([name, provider]) => {
       const resolvedKey = typeof provider.apiKey === "string"
-        ? resolveEnvValue(provider.apiKey)?.trim()
+        ? resolveProviderApiKey(provider.apiKey)?.trim()
         : undefined;
       const activeKeyId = resolvedKey ? apiKeyPoolEntryId(resolvedKey) : "none";
       return `${name}:${provider.adapter}:${provider.authMode ?? "key"}:${providerCodexAccountMode(name, provider) ?? "none"}:${provider.disabled === true ? "off" : "on"}:${provider.baseUrl}:${activeKeyId}`;
@@ -317,11 +336,13 @@ function isCanonicalClineBaseUrl(baseUrl: string): boolean {
   return normalized === CLINE_BASE_URL || normalized === `${CLINE_BASE_URL}/api/v1`;
 }
 
-function isCanonicalOllamaCloudBaseUrl(baseUrl: string): boolean {
-  // The dashboard row points at https://ollama.com/v1 (the OpenAI-compat spelling); the
-  // usage API lives on the bare origin, so the canonical set is the origin and the /v1 row.
-  const normalized = normalizedBaseUrl(baseUrl);
-  return normalized === OLLAMA_CLOUD_BASE_URL || normalized === `${OLLAMA_CLOUD_BASE_URL}/v1`;
+function isCanonicalOllamaCloudBaseUrl(baseUrl?: string): boolean {
+  if (!baseUrl) return false;
+  try {
+    return isCanonicalOllamaCloudUrl(baseUrl);
+  } catch {
+    return false;
+  }
 }
 
 function isCanonicalZaiBaseUrl(baseUrl: string): boolean {
@@ -379,7 +400,7 @@ function firstFinite(record: Record<string, unknown> | null, names: string[]): n
 async function fetchA6apiQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   // Never send a configured API key to a lookalike host or through a redirect.
   if (!isCanonicalA6apiBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const headers = { Accept: "application/json", Authorization: `Bearer ${apiKey}` } as const;
   const [subscriptionResponse, tokenResponse] = await Promise.all([
@@ -473,7 +494,7 @@ function parseOpenCodeGoUsageWindow(value: unknown): { percent: number; resetAt?
 async function fetchOpenCodeGoQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   // Never send a configured API key when the provider destination is not the built-in Go endpoint.
   if (!isCanonicalOpenCodeGoBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(OPENCODE_GO_USAGE_URL, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -519,7 +540,7 @@ async function fetchOpenCodeGoQuota(provider: string, config: OcxProviderConfig)
 async function fetchOpenRouterQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   // Never send a configured API key to a lookalike host or through a redirect.
   if (!isCanonicalOpenRouterBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${OPENROUTER_BASE_URL}/key`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -566,7 +587,7 @@ async function fetchOpenRouterQuota(provider: string, config: OcxProviderConfig)
  */
 async function fetchDeepSeekQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalDeepSeekBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${DEEPSEEK_BASE_URL}/user/balance`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -611,7 +632,7 @@ async function fetchDeepSeekQuota(provider: string, config: OcxProviderConfig): 
  */
 async function fetchClineQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalClineBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${CLINE_BASE_URL}/api/v1/users/me/plan/usage-limits`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -656,60 +677,51 @@ async function fetchClineQuota(provider: string, config: OcxProviderConfig): Pro
 }
 
 /**
- * Ollama Cloud `GET /api/usage` — the official usage endpoint behind the
- * dashboard's settings page, documented at docs.ollama.com/cloud and served
- * to any personal API key as `Authorization: Bearer`. The payload carries an
- * `activity` block (4-week spend + per-model request/cost rows) and a
- * `limits` block whose key set varies by plan: Max plans report fractional
- * `session`/`weekly` windows, Max-included plans report a `monthly` window
- * carrying used/limit dollars. Every `limits.*.usage` row observed so far is
- * a CONSUMED FRACTION in 0..1 (not percent), so it maps straight onto the
- * ProviderQuota percent fields; `monthly` additionally carries `used`/`limit`
- * dollar amounts, which surface as a labeled custom window.
- *
- * There is no reset timestamp in the payload (the settings page renders its
- * own clock), so windows are published without resetAt — the dashboard shows
- * the bar without a countdown, matching what the upstream actually knows.
+ * Ollama Cloud `GET https://ollama.com/api/usage` — returns account usage.
+ * Legacy plans report rolling 5-hour `limits.session.usage` and 7-day
+ * `limits.weekly.usage`. Migrated monthly-credit plans report
+ * `limits.monthly.usage`. `usage` values are normalized fractions (0..1).
  */
-async function fetchOllamaQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
-  // Never send the API key to a lookalike host: this credential also authorizes inference.
-  if (!isCanonicalOllamaCloudBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
-  if (!apiKey) return null;
-  const response = await fetch(OLLAMA_CLOUD_USAGE_URL, {
-    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
-      ? TERMINAL_QUOTA_FAILURE
-      : null;
-  }
-  const body = asRecord(await readQuotaJson(response));
-  const limits = asRecord(body?.limits);
+function parseOllamaPercent(usageValue: unknown): number | undefined {
+  const usage = toFiniteNumber(usageValue);
+  if (usage === undefined || usage < 0) return undefined;
+  const percent = Math.round(usage * 10000) / 100;
+  return normalizePercent(percent);
+}
+
+export function parseOllamaCloudQuota(body: Record<string, unknown> | null): ProviderQuota | null {
+  if (!body) return null;
+  const limits = asRecord(body.limits);
   if (!limits) return null;
+
   const quota: ProviderQuota = { updatedAt: Date.now() };
   let windows = 0;
+
   const session = asRecord(limits.session);
-  const sessionPercent = normalizePercent(toFiniteNumber(session?.usage));
-  if (sessionPercent !== undefined) {
-    // Fractional shares arrive in 0..1; a percent-scale payload would clamp to 100.
-    quota.fiveHourPercent = sessionPercent <= 1 ? sessionPercent * 100 : sessionPercent;
-    windows += 1;
+  if (session) {
+    const percent = parseOllamaPercent(session.usage);
+    if (percent !== undefined) {
+      quota.fiveHourPercent = percent;
+      windows += 1;
+    }
   }
+
   const weekly = asRecord(limits.weekly);
-  const weeklyPercent = normalizePercent(toFiniteNumber(weekly?.usage));
-  if (weeklyPercent !== undefined) {
-    quota.weeklyPercent = weeklyPercent <= 1 ? weeklyPercent * 100 : weeklyPercent;
-    windows += 1;
+  if (weekly) {
+    const percent = parseOllamaPercent(weekly.usage);
+    if (percent !== undefined) {
+      quota.weeklyPercent = percent;
+      windows += 1;
+    }
   }
+
   const monthly = asRecord(limits.monthly);
   if (monthly) {
-    const monthlyPercent = normalizePercent(toFiniteNumber(monthly.usage));
-    if (monthlyPercent !== undefined) {
-      quota.monthlyPercent = monthlyPercent <= 1 ? monthlyPercent * 100 : monthlyPercent;
+    const percent = parseOllamaPercent(monthly.usage);
+    if (percent !== undefined) {
+      quota.monthlyPercent = percent;
       windows += 1;
+      // Max-included plans carry used/limit dollar amounts; surface them as a labeled window.
       const used = toFiniteNumber(monthly.used);
       const limit = toFiniteNumber(monthly.limit);
       if (used !== undefined && limit !== undefined && limit > 0) {
@@ -720,6 +732,28 @@ async function fetchOllamaQuota(provider: string, config: OcxProviderConfig): Pr
       }
     }
   }
+
+  return windows > 0 ? quota : null;
+}
+
+async function fetchOllamaCloudQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+  const effectiveBaseUrl = config.baseUrl ?? getProviderRegistryEntry(provider)?.baseUrl ?? "";
+  if (!isCanonicalOllamaCloudBaseUrl(effectiveBaseUrl)) return null;
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
+  if (!apiKey) return null;
+  const response = await fetch(OLLAMA_CLOUD_USAGE_URL, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    if (response.status === 404) return null;
+    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+      ? TERMINAL_QUOTA_FAILURE
+      : null;
+  }
+  const body = asRecord(await readQuotaJson(response));
+  const quota = parseOllamaCloudQuota(body) ?? { updatedAt: Date.now() };
   // Plan level comes from POST /api/me (the dashboard's own identity probe; GET is
   // 405 by design). It is identity metadata, not a quota window: fail-soft, and a
   // failure keeps the usage bars while omitting the plan row.
@@ -740,7 +774,9 @@ async function fetchOllamaQuota(provider: string, config: OcxProviderConfig): Pr
     label: `Plan: ${plan}`,
     percent: 0,
   }];
-  return windows > 0 || plan ? report(provider, "ollama:api-usage", quota) : null;
+  return quota.fiveHourPercent !== undefined || quota.weeklyPercent !== undefined || quota.monthlyPercent !== undefined || plan || quota.customWindows?.length
+    ? report(provider, "ollama-cloud:usage", quota)
+    : null;
 }
 
 /**
@@ -847,7 +883,7 @@ function parseZaiQuotaLegacyFields(data: Record<string, unknown> | null): Provid
  */
 async function fetchZaiQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalZaiBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const normalized = normalizedBaseUrl(config.baseUrl);
   const monitorHost = normalized === ZAI_BASE_URL || normalized === `${ZAI_BASE_URL}/api/coding/paas/v4`
@@ -890,7 +926,7 @@ async function fetchZaiQuota(provider: string, config: OcxProviderConfig): Promi
  */
 async function fetchMinimaxQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalMinimaxBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const cnHost = normalizedBaseUrl(config.baseUrl)?.startsWith("https://api.minimaxi.com");
   const remainsUrl = cnHost ? "https://api.minimaxi.com/v1/token_plan/remains" : MINIMAX_REMAINS_URL;
@@ -934,7 +970,7 @@ async function fetchMinimaxQuota(provider: string, config: OcxProviderConfig): P
  */
 async function fetchMoonshotQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalMoonshotBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const host = normalizedBaseUrl(config.baseUrl)?.startsWith("https://api.moonshot.cn") ? "https://api.moonshot.cn/v1" : MOONSHOT_BASE_URL;
   const response = await fetch(`${host}/users/me/balance`, {
@@ -978,7 +1014,7 @@ async function fetchMoonshotQuota(provider: string, config: OcxProviderConfig): 
  */
 async function fetchVeniceQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalVeniceBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${VENICE_BASE_URL}/billing/balance`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -1021,7 +1057,7 @@ async function fetchVeniceQuota(provider: string, config: OcxProviderConfig): Pr
  */
 async function fetchSyntheticQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalSyntheticBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${SYNTHETIC_BASE_URL}/quotas`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -1069,7 +1105,7 @@ async function fetchSyntheticQuota(provider: string, config: OcxProviderConfig):
  */
 async function fetchDeepInfraQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalDeepInfraBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${DEEPINFRA_BASE_URL}/payment/checklist?compute_owed=true`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -1111,7 +1147,7 @@ async function fetchDeepInfraQuota(provider: string, config: OcxProviderConfig):
  */
 async function fetchNeuralwattQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   if (!isCanonicalNeuralwattBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
   const response = await fetch(`${NEURALWATT_BASE_URL}/quota`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -1181,7 +1217,8 @@ function tagNativeMainReport(
 
 function isProviderQuotaReportCurrent(value: ProviderQuotaReport): boolean {
   const generation = nativeMainReportGenerations.get(value);
-  return generation === undefined || isMainAccountIdentityGenerationLive(generation);
+  return (generation === undefined || isMainAccountIdentityGenerationLive(generation))
+    && (accountReportCurrent.get(value)?.() ?? true);
 }
 
 async function fetchChatGptForwardQuota(
@@ -1302,6 +1339,7 @@ export function parseXaiCreditsResponse(value: unknown): { percent: number; rese
 async function fetchXaiWeeklyCredits(accessToken: string, userId: string): Promise<ProviderQuota | null> {
   try {
     const response = await fetch(XAI_CREDITS_URL, {
+      redirect: "error",
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -1325,16 +1363,11 @@ async function fetchXaiWeeklyCredits(accessToken: string, userId: string): Promi
   }
 }
 
-async function fetchXaiQuota(provider: string): Promise<ProviderQuotaReport | null> {
-  let accessToken: string;
-  try {
-    accessToken = await getValidAccessToken("xai");
-  } catch {
-    return null;
-  }
+async function fetchXaiQuota(provider: string, context: { accessToken: string; upstreamAccountId?: string }): Promise<ProviderQuotaReport | null> {
+  const { accessToken } = context;
 
   // Prefer the SuperGrok weekly credits window that actually gates prompting (#1283).
-  const userId = getCredential("xai")?.accountId?.trim() || xaiUserIdFromAccessToken(accessToken);
+  const userId = context.upstreamAccountId?.trim() || xaiUserIdFromAccessToken(accessToken);
   if (userId) {
     const weekly = await fetchXaiWeeklyCredits(accessToken, userId);
     if (weekly) return report(provider, "xai:grok-billing-credits", weekly);
@@ -1343,6 +1376,7 @@ async function fetchXaiQuota(provider: string): Promise<ProviderQuotaReport | nu
   // Legacy monthly dollar pool — retained when weekly is unavailable.
   try {
     const response = await fetch(XAI_BILLING_URL, {
+      redirect: "error",
       headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -1395,6 +1429,21 @@ function parseClaudeLimit(value: unknown): { label: string; percent: number; res
 /** Claude's OAuth usage endpoint, probed with ONE account's own bearer token. */
 const anthropicUsageInflight = new Map<string, Promise<ProviderQuota | null>>();
 
+/**
+ * Anthropic per-credential usage.
+ *
+ * This endpoint reports quota only. Its body carries `five_hour`, `seven_day`, the
+ * model-scoped weekly buckets (`seven_day_fable`/`_opus`/`_sonnet`) and a `limits` array,
+ * and **no subscription or tier field** — nor does the OAuth token response, which yields only
+ * `account.uuid` and `account.email_address` (`src/oauth/anthropic.ts`). That is why
+ * `OAuthAccountSummary.plan` is `null` for Anthropic rather than populated here (#3777); it is
+ * a missing upstream field, not an unfinished mapping.
+ *
+ * A tier must not be inferred from what is here. Percentages are normalized per account, so a
+ * Max x5 seat at 50% is byte-identical to a Max x20 seat at 50%, and the presence of a
+ * model-scoped window tracks entitlement rather than seat size. Populate `plan` only when
+ * upstream returns the tier itself.
+ */
 async function fetchAnthropicUsageQuota(accessToken: string): Promise<ProviderQuota | null> {
   const joinable = anthropicUsageInflight.get(accessToken);
   if (joinable) return joinable;
@@ -1505,6 +1554,29 @@ async function fetchKiroQuota(provider: string): Promise<ProviderQuotaReport | n
   return report(provider, "kiro:usage-limits", snapshot.quota);
 }
 
+/**
+ * Provider-level row for a passive provider: the ACTIVE account's last observed
+ * subscription windows, the same shape `fetchAnthropicQuota` and `fetchKiroQuota`
+ * return.
+ *
+ * Cache-only. A dashboard load or `ocx account refresh` must never spend an inference
+ * turn, so `forceRefresh` does not exist on this path — there is nothing to refresh.
+ * `report.updatedAt` is the observation time, which is what both GUI surfaces render
+ * as the relative age of the row.
+ */
+async function fetchPassiveProviderQuota(provider: string): Promise<ProviderQuotaReport | null> {
+  const activeId = getAccountSet(provider)?.activeAccountId;
+  if (!activeId) return null;
+  // Idempotent; without it a proxy restart shows nothing until the next streaming turn
+  // even though the last observation is on disk.
+  hydrateAccountQuotaCache();
+  const entry = accountQuotaCache.get(accountCacheKey(provider, activeId));
+  if (!entry?.quota) return null;
+  const built = report(provider, `${provider}:subscription-observation`, entry.quota);
+  // Tagged here rather than inside report(), which every probed path shares.
+  return built ? { ...built, observed: true } : null;
+}
+
 // ---------------------------------------------------------------------------
 // Per-account quota (multiauth)
 // ---------------------------------------------------------------------------
@@ -1522,8 +1594,65 @@ type AccountQuotaCacheEntry = {
   quota: ProviderQuota | null;
   /** Last probe failed (429 / network / expired login); still may hold last-good quota. */
   unavailable?: true;
+  /** Private new-reader identity; never persisted or serialized. */
+  identity?: string;
+  isCurrent?: () => boolean;
 };
+/** Expired measurements become unknown; missing reset evidence never implies a fresh allowance. */
+function normalizeAnthropicQuota(quota: ProviderQuota | null | undefined, now: number): ProviderQuota | null {
+  if (!quota) return null;
+  const validReset = (resetAt: unknown): resetAt is number => typeof resetAt === "number"
+    && Number.isFinite(resetAt) && resetAt > 0 && Number.isFinite(new Date(resetAt).getTime());
+  let result = quota;
+  for (const [percent, reset] of [
+    ["fiveHourPercent", "fiveHourResetAt"],
+    ["weeklyPercent", "weeklyResetAt"],
+    ["monthlyPercent", "monthlyResetAt"],
+  ] as const) {
+    const resetAt = quota[reset];
+    if (resetAt === undefined) continue;
+    const valid = validReset(resetAt);
+    if (valid && resetAt > now) continue;
+    if (result === quota) result = { ...quota };
+    if (valid) delete result[percent];
+    delete result[reset];
+  }
+  // Persisted rows validate only the outer quota object, so custom data may be malformed.
+  if (quota.customWindows !== undefined) {
+    const windows = Array.isArray(quota.customWindows) ? quota.customWindows : [];
+    const retained: ProviderQuotaWindow[] = [];
+    let changed = !Array.isArray(quota.customWindows);
+    for (const window of windows) {
+      if (!window || typeof window !== "object" || typeof window.label !== "string" || !window.label.trim()
+        || typeof window.percent !== "number" || !Number.isFinite(window.percent)
+        || window.percent < 0 || window.percent > 100) {
+        changed = true;
+        continue;
+      }
+      if (validReset(window.resetAt) && window.resetAt <= now) {
+        changed = true;
+        continue;
+      }
+      if (window.resetAt !== undefined && !validReset(window.resetAt)) {
+        const normalized = { ...window };
+        delete normalized.resetAt;
+        retained.push(normalized);
+        changed = true;
+      } else {
+        retained.push(window);
+      }
+    }
+    if (changed) {
+      if (result === quota) result = { ...quota };
+      if (retained.length) result.customWindows = retained;
+      else delete result.customWindows;
+    }
+  }
+  return hasQuotaRows(result) ? result : null;
+}
+
 const accountQuotaCache = new Map<string, AccountQuotaCacheEntry>();
+let explicitAccountEpoch = 0;
 
 /**
  * Seed the cache from the last run, once.
@@ -1538,14 +1667,23 @@ function hydrateAccountQuotaCache(): void {
   if (diskHydrated) return;
   diskHydrated = true;
   for (const [key, quota] of readPersistedAccountQuotas()) {
-    if (!accountQuotaCache.has(key)) accountQuotaCache.set(key, { ts: quota.updatedAt, quota });
+    // Disk stores observation time, not the Anthropic usage probe's clock.
+    if (!accountQuotaCache.has(key)) {
+      const anthropic = key.startsWith("anthropic\u0000");
+      accountQuotaCache.set(key, {
+        ts: anthropic ? 0 : quota.updatedAt,
+        quota: anthropic ? normalizeAnthropicQuota(quota, Date.now()) : quota,
+      });
+    }
   }
 }
 
 function persistAccountQuotaCache(): void {
   schedulePersistAccountQuotas(function* () {
+    const now = Date.now();
     for (const [key, entry] of accountQuotaCache) {
-      if (entry.quota) yield [key, entry.quota] as [string, ProviderQuota];
+      const quota = key.startsWith("anthropic\u0000") ? normalizeAnthropicQuota(entry.quota, now) : entry.quota;
+      if (quota) yield [key, quota] as [string, ProviderQuota];
     }
   });
 }
@@ -1567,11 +1705,21 @@ export interface ProviderAccountQuota {
   quota: ProviderQuota | null;
   /** Set when the probe could not reach upstream (expired login, 429, network). */
   unavailable?: true;
+  isCurrent?: () => boolean;
 }
 
 /** Providers whose per-account quota can be probed. Extend as other OAuth APIs are covered. */
 export function supportsPerAccountQuota(provider: string): boolean {
-  return provider === "anthropic" || provider === "kiro";
+  return provider === "anthropic" || provider === "kiro" || provider === "google-antigravity"
+    || explicitAccountReader(provider);
+}
+
+function explicitAccountReader(provider: string): boolean {
+  return provider === "xai" || provider === "cursor" || provider === "kimi" || provider === "command-code";
+}
+
+export function providerOAuthAccountQuotaMode(provider: string): AccountQuotaMode {
+  return hasPassiveAccountQuota(provider) ? "passive" : supportsPerAccountQuota(provider) ? "probe" : "unsupported";
 }
 
 function accountCacheKey(provider: string, accountId: string): string {
@@ -1584,7 +1732,8 @@ function accountCacheKey(provider: string, accountId: string): string {
  */
 export function getCachedProviderAccountQuota(provider: string, accountId: string): ProviderQuota | null {
   const entry = accountQuotaCache.get(accountCacheKey(provider, accountId));
-  return entry?.quota ?? null;
+  if (entry?.isCurrent && !entry.isCurrent()) return null;
+  return provider === "anthropic" ? normalizeAnthropicQuota(entry?.quota, Date.now()) : entry?.quota ?? null;
 }
 
 /** Test-only: seed or clear the per-account quota cache without probing upstream. */
@@ -1601,10 +1750,145 @@ export function setCachedProviderAccountQuotaForTests(
   accountQuotaCache.set(key, { ts: Date.now(), quota });
 }
 
+/** Unified headers report utilization fractions and epoch-second reset times. */
+function anthropicHeaderResetAt(value: string | null): number | undefined {
+  const seconds = toFiniteNumber(value);
+  if (seconds === undefined || seconds <= 0) return undefined;
+  const timestamp = seconds * 1000;
+  return Number.isFinite(new Date(timestamp).getTime()) ? timestamp : undefined;
+}
+
+export function parseAnthropicRateLimitHeaders(headers: Headers): ProviderQuota | null {
+  const fiveHourPercent = normalizeUtilizationFraction(headers.get("anthropic-ratelimit-unified-5h-utilization"));
+  const weeklyPercent = normalizeUtilizationFraction(headers.get("anthropic-ratelimit-unified-7d-utilization"));
+  if (fiveHourPercent === undefined && weeklyPercent === undefined) return null;
+  const fiveHourResetAt = anthropicHeaderResetAt(headers.get("anthropic-ratelimit-unified-5h-reset"));
+  const weeklyResetAt = anthropicHeaderResetAt(headers.get("anthropic-ratelimit-unified-7d-reset"));
+  return {
+    ...(fiveHourPercent !== undefined ? { fiveHourPercent } : {}),
+    ...(fiveHourPercent !== undefined && fiveHourResetAt !== undefined ? { fiveHourResetAt } : {}),
+    ...(weeklyPercent !== undefined ? { weeklyPercent } : {}),
+    ...(weeklyPercent !== undefined && weeklyResetAt !== undefined ? { weeklyResetAt } : {}),
+    updatedAt: Date.now(),
+  };
+}
+
+/** Reject unknown scales; round fraction conversion for persisted/displayed percentages. */
+function normalizeUtilizationFraction(value: string | null): number | undefined {
+  const numeric = toFiniteNumber(value);
+  if (numeric === undefined || numeric < 0 || numeric > 1) return undefined;
+  return Math.round(numeric * 10_000) / 100;
+}
+
+/**
+ * Merge serving-account observations without advancing the usage probe's clock or
+ * erasing model-specific windows. The caller owns credential attribution; this guard
+ * prevents a retired account key from being revived by an older config generation.
+ */
+export function recordAnthropicAccountQuotaFromHeaders(
+  accountId: string,
+  headers: Headers,
+  writerGeneration: number,
+): void {
+  if (!accountId) return;
+  const observed = parseAnthropicRateLimitHeaders(headers);
+  if (!observed) return;
+  const key = accountCacheKey("anthropic", accountId);
+  if (!mayCommitAccountQuotaKey(key, writerGeneration)) return;
+  // Hydrate before writing, for the same reason `recordPassiveAccountQuota` does: this write
+  // arrives unprompted from the request path, and `persistAccountQuotaCache` serializes the
+  // whole map. Landing before any reader has hydrated would persist this single row and erase
+  // every other provider's saved row.
+  hydrateAccountQuotaCache();
+  const previous = accountQuotaCache.get(key);
+  accountQuotaCache.set(key, {
+    ...previous,
+    // Headers do not prove that the last usage probe succeeded.
+    ts: previous?.ts ?? 0,
+    quota: normalizeAnthropicQuota({
+      ...normalizeAnthropicQuota(previous?.quota, observed.updatedAt), ...observed,
+    }, observed.updatedAt),
+  });
+  persistAccountQuotaCache();
+}
+
+/**
+ * Providers whose per-account quota is OBSERVED in-band, never probed.
+ *
+ * Deliberately separate from `supportsPerAccountQuota` rather than folded into it. That
+ * predicate gates explicit upstream readers. Meta publishes no quota endpoint, so it
+ * remains a cache-only observation even when every probe reader is account-scoped.
+ */
+export function hasPassiveAccountQuota(provider: string): boolean {
+  return provider === "meta-muse";
+}
+
+/**
+ * Record a quota observed in-band on a streaming turn.
+ *
+ * The CALLER captures `writerGeneration` when it resolves the serving credential, not
+ * this function at write time. A streaming turn is a long await, and a generation
+ * captured immediately before the write cannot see a config or account change that
+ * happened EARLIER in the same turn — which is exactly the case the fence exists for.
+ */
+export function recordPassiveAccountQuota(
+  provider: string,
+  accountId: string,
+  quota: ProviderQuota,
+  writerGeneration: number,
+): void {
+  if (!hasPassiveAccountQuota(provider) || !accountId) return;
+  const key = accountCacheKey(provider, accountId);
+  if (!mayCommitAccountQuotaKey(key, writerGeneration)) return;
+  // Hydrate BEFORE writing, not only on the read path. `persistAccountQuotaCache`
+  // serializes the whole in-memory map, so a passive write that lands before anything
+  // has read the cache would persist this one row and erase every other provider's
+  // saved row -- and `diskHydrated` would then stop any later reader from recovering
+  // them. A probe writer cannot hit this because its own read hydrates first; an
+  // observation arrives unprompted, so it must hydrate itself.
+  hydrateAccountQuotaCache();
+  accountQuotaCache.set(key, { ts: Date.now(), quota });
+  // Persisted so a restart keeps the last observation: with no probe to re-establish it,
+  // a forgotten row stays forgotten until the user happens to run another streaming turn.
+  persistAccountQuotaCache();
+  // sweepExpiredOnWrite is deliberately NOT called. Existing probe writers call it
+  // because they run on a poll; this runs on the request path, where a state sweep does
+  // not belong. Passive rows are still reclaimed by generation reconciliation
+  // (reconcileProviderAccountQuotaRows) and by the disk reader's age bound.
+}
+
+/**
+ * Cache-only per-account rows for a passive provider. Never probes, never refreshes.
+ *
+ * An account with no observation is OMITTED rather than returned with `quota: null` and
+ * `unavailable`: that pair means "a probe was attempted and failed", and no probe was
+ * ever attempted here. A user who has not yet run a streaming turn simply has no
+ * measurement, which is not an error state.
+ */
+export function readPassiveProviderAccountQuotas(provider: string): ProviderAccountQuota[] {
+  if (!hasPassiveAccountQuota(provider)) return [];
+  // Idempotent, and otherwise only reached from probe paths a passive provider never
+  // enters — without it a restart shows nothing until the next streaming turn, even
+  // though the row is sitting on disk.
+  hydrateAccountQuotaCache();
+  const set = getAccountSet(provider);
+  if (!set) return [];
+  const rows: ProviderAccountQuota[] = [];
+  for (const account of set.accounts) {
+    const entry = accountQuotaCache.get(accountCacheKey(provider, account.id));
+    if (entry?.quota) rows.push({ accountId: account.id, quota: entry.quota });
+  }
+  return rows;
+}
+
 export function sweepExpiredProviderAccountQuotaRows(now = Date.now()): number {
   let removed = 0;
   for (const [key, entry] of accountQuotaCache) {
-    if (entry.ts + ACCOUNT_QUOTA_TTL_MS > now) continue;
+    // Anthropic observations extend retention, never the usage probe's eligibility clock.
+    const retainedAt = key.startsWith("anthropic\u0000")
+      ? Math.max(entry.ts, entry.quota?.updatedAt ?? 0)
+      : entry.ts;
+    if (retainedAt + ACCOUNT_QUOTA_TTL_MS > now) continue;
     accountQuotaCache.delete(key);
     removed += 1;
   }
@@ -1643,6 +1927,7 @@ export function resetProviderQuotaReconcileStateForTests(): void {
 
 /** Drop cached per-account rows (all, or just one provider's). */
 export function clearAccountQuotaCache(provider?: string): void {
+  explicitAccountEpoch += 1;
   if (!provider) {
     accountQuotaCache.clear();
     accountQuotaInflight.clear();
@@ -1687,15 +1972,122 @@ async function getTokenForAccountQuotaProbe(provider: string, accountId: string)
   return getValidAccessTokenForAccount(provider, accountId);
 }
 
+function explicitQuotaConfig(provider: string, configured?: OcxProviderConfig): OcxProviderConfig | undefined {
+  if (configured) return configured;
+  const entry = getProviderRegistryEntry(provider);
+  return entry ? { adapter: entry.adapter, baseUrl: entry.baseUrl, authMode: "oauth" } : undefined;
+}
+
+function explicitQuotaIdentity(provider: string, accountId: string, configured?: OcxProviderConfig): string | undefined {
+  const credential = getAccountCredential(provider, accountId);
+  const target = explicitQuotaConfig(provider, configured);
+  if (!credential || !target) return undefined;
+  return createHash("sha256").update(JSON.stringify([
+    provider, accountId, credential.access, credential.refresh, credential.expires,
+    credential.accountId, credential.projectId, credential.source,
+    target.adapter, target.baseUrl, target.authMode, target.disabled === true,
+  ])).digest("hex");
+}
+
+function explicitQuotaDestination(provider: string, config: OcxProviderConfig): boolean {
+  if (config.disabled === true || config.authMode !== "oauth") return false;
+  if (provider === "kimi") return isCanonicalKimiCodeBaseUrl(config.baseUrl);
+  if (provider === "command-code") return isCanonicalCommandCodeBaseUrl(config.baseUrl);
+  // These readers use fixed canonical billing origins, never config.baseUrl.
+  return provider === "xai" || provider === "cursor";
+}
+
+async function readExplicitAccountQuota(provider: string, accountId: string, configured?: OcxProviderConfig): Promise<{
+  result: ProviderQuotaProbeResult;
+  identity: string | undefined;
+  isCurrent: () => boolean;
+} | null> {
+  const target = explicitQuotaConfig(provider, configured);
+  if (!target || !explicitQuotaDestination(provider, target)) return null;
+  const config = { ...target };
+  const epoch = explicitAccountEpoch;
+  const accessToken = await getTokenForAccountQuotaProbe(provider, accountId);
+  const credential = getAccountCredential(provider, accountId);
+  if (!credential || credential.access !== accessToken) return null;
+  // Pair the post-renewal credential with the destination captured before renewal.
+  const identity = explicitQuotaIdentity(provider, accountId, config);
+  const isCurrent = () => epoch === explicitAccountEpoch
+    && identity === explicitQuotaIdentity(provider, accountId, configured);
+  if (!isCurrent()) return null;
+  let result: ProviderQuotaProbeResult;
+  switch (provider) {
+    case "xai": result = await fetchXaiQuota(provider, { accessToken, upstreamAccountId: credential.accountId }); break;
+    case "cursor": result = await fetchCursorQuota(provider, accessToken); break;
+    case "kimi": result = await fetchKimiQuota(provider, config, accessToken); break;
+    case "command-code": result = await fetchCommandCodeQuota(provider, config, accessToken); break;
+    default: return null;
+  }
+  return { result, identity, isCurrent };
+}
+
+async function fetchExplicitAccountQuota(provider: string, accountId: string, force: boolean, configured?: OcxProviderConfig): Promise<AccountQuotaCacheEntry> {
+  const key = accountCacheKey(provider, accountId);
+  const identity = explicitQuotaIdentity(provider, accountId, configured);
+  const previous = accountQuotaCache.get(key);
+  const cached = identity && previous?.identity === identity && previous.isCurrent?.() ? previous : undefined;
+  if (!force && cached && Date.now() - cached.ts < ACCOUNT_QUOTA_TTL_MS
+    && (!cached.quota || Date.now() - cached.quota.updatedAt < LAST_GOOD_MAX_AGE_MS)) return cached;
+  const flightKey = `${key}\u0000${identity ?? "missing"}`;
+  const running = accountQuotaInflight.get(flightKey);
+  if (running) return running;
+  const epoch = explicitAccountEpoch;
+  const lastGood = cached?.quota && Date.now() - cached.quota.updatedAt < LAST_GOOD_MAX_AGE_MS ? cached.quota : null;
+  const flight = (async (): Promise<AccountQuotaCacheEntry> => {
+    let read: Awaited<ReturnType<typeof readExplicitAccountQuota>> = null;
+    try { read = await readExplicitAccountQuota(provider, accountId, configured); } catch { /* unavailable */ }
+    const isCurrent = read?.isCurrent ?? (() => epoch === explicitAccountEpoch && !!identity
+      && identity === explicitQuotaIdentity(provider, accountId, configured));
+    const result = read?.result;
+    const current = epoch === explicitAccountEpoch && isCurrent();
+    const quota = current && result && typeof result !== "symbol" ? result.quota : null;
+    const empty = result === AUTHORITATIVE_EMPTY_QUOTA;
+    const entry: AccountQuotaCacheEntry = {
+      ts: Date.now(),
+      quota: quota ?? (current && result !== TERMINAL_QUOTA_FAILURE && !empty
+        && lastGood && Date.now() - lastGood.updatedAt < LAST_GOOD_MAX_AGE_MS ? lastGood : null),
+      ...(!current || (!quota && !empty) ? { unavailable: true as const } : {}),
+      identity: read?.identity ?? identity,
+      isCurrent: () => epoch === explicitAccountEpoch && isCurrent(),
+    };
+    if (entry.isCurrent?.()) accountQuotaCache.set(key, entry);
+    return entry;
+  })().finally(() => { if (accountQuotaInflight.get(flightKey) === flight) accountQuotaInflight.delete(flightKey); });
+  accountQuotaInflight.set(flightKey, flight);
+  return flight;
+}
+
+async function fetchExplicitCurrentQuota(provider: string, config: OcxProviderConfig, liveConfig: OcxConfig): Promise<ProviderQuotaProbeResult> {
+  const id = getAccountSet(provider)?.activeAccountId;
+  if (!id) return null;
+  const read = await readExplicitAccountQuota(provider, id, config);
+  if (!read) return null;
+  const isCurrent = () => liveConfig.providers[provider] === config
+    && read.isCurrent() && getAccountSet(provider)?.activeAccountId === id;
+  if (!isCurrent()) return TERMINAL_QUOTA_FAILURE;
+  if (read.result && typeof read.result !== "symbol") accountReportCurrent.set(read.result, isCurrent);
+  return read.result;
+}
+
 async function fetchAccountQuota(
   provider: string,
   accountId: string,
   forceRefresh: boolean,
+  providerConfig?: OcxProviderConfig,
 ): Promise<AccountQuotaCacheEntry> {
+  if (!supportsPerAccountQuota(provider)) return { ts: Date.now(), quota: null, unavailable: true };
+  if (explicitAccountReader(provider)) return fetchExplicitAccountQuota(provider, accountId, forceRefresh, providerConfig);
+  if (provider === "anthropic") hydrateAccountQuotaCache();
   const key = accountCacheKey(provider, accountId);
   const writerGeneration = captureConfigGeneration();
   const cached = accountQuotaCache.get(key);
-  if (!forceRefresh && cached && Date.now() - cached.ts < ACCOUNT_QUOTA_TTL_MS) return cached;
+  if (!forceRefresh && cached && Date.now() - cached.ts < ACCOUNT_QUOTA_TTL_MS) {
+    return provider === "anthropic" ? { ...cached, quota: normalizeAnthropicQuota(cached.quota, Date.now()) } : cached;
+  }
   const joinable = accountQuotaInflight.get(key);
   if (joinable) return joinable;
 
@@ -1714,14 +2106,27 @@ async function fetchAccountQuota(
         quota = kiroSnapshot?.quota ?? null;
       } else {
         const token = await getTokenForAccountQuotaProbe(provider, accountId);
-        quota = await fetchAnthropicUsageQuota(token);
+        if (provider === "google-antigravity") {
+          // Per-account Gem/Cla windows (#1082). The project id is part of the stored
+          // credential; without it the probe cannot be made, and that is "unavailable",
+          // never 0%.
+          const projectId = getAccountCredential(provider, accountId)?.projectId;
+          if (!projectId) throw new Error("antigravity account has no project id");
+          quota = await fetchAntigravityUsageQuota(token, projectId);
+        } else if (provider === "anthropic") {
+          quota = await fetchAnthropicUsageQuota(token);
+        } else {
+          return { ts: Date.now(), quota: null, unavailable: true };
+        }
       }
       if (!quota) {
         // Preserve last-good bars and mark unavailable; advance TTL so failures
         // negative-cache instead of re-probing on every GUI poll.
         const entry: AccountQuotaCacheEntry = {
           ts: Date.now(),
-          quota: cached?.quota ?? null,
+          // Settle once for all joiners against observations committed during the probe.
+          quota: provider === "anthropic"
+            ? normalizeAnthropicQuota(accountQuotaCache.get(key)?.quota, Date.now()) : cached?.quota ?? null,
           unavailable: true,
         };
         if (mayCommitAccountQuotaKey(key, writerGeneration)) {
@@ -1731,7 +2136,9 @@ async function fetchAccountQuota(
         }
         return entry;
       }
-      const entry: AccountQuotaCacheEntry = { ts: Date.now(), quota };
+      const entry: AccountQuotaCacheEntry = {
+        ts: Date.now(), quota: provider === "anthropic" ? normalizeAnthropicQuota(quota, Date.now()) : quota,
+      };
       if (mayCommitAccountQuotaKey(key, writerGeneration)) {
         accountQuotaCache.set(key, entry);
         // Exhaustion state rides the SAME commit guard as the quota row: a probe from a
@@ -1743,7 +2150,8 @@ async function fetchAccountQuota(
     } catch {
       const entry: AccountQuotaCacheEntry = {
         ts: Date.now(),
-        quota: cached?.quota ?? null,
+        quota: provider === "anthropic"
+          ? normalizeAnthropicQuota(accountQuotaCache.get(key)?.quota, Date.now()) : cached?.quota ?? null,
         unavailable: true,
       };
       if (mayCommitAccountQuotaKey(key, writerGeneration)) {
@@ -1766,18 +2174,27 @@ async function fetchAccountQuota(
 export async function fetchProviderAccountQuotas(
   provider: string,
   forceRefresh = false,
+  providerConfig?: OcxProviderConfig,
 ): Promise<ProviderAccountQuota[]> {
   if (!supportsPerAccountQuota(provider)) return [];
   const set = getAccountSet(provider);
   if (!set) return [];
-  return await Promise.all(set.accounts.map(async account => {
-    const entry = await fetchAccountQuota(provider, account.id, forceRefresh);
-    return {
+  return mapQuotaRoster(set.accounts, async account => {
+    const entry = await fetchAccountQuota(provider, account.id, forceRefresh, providerConfig);
+    const result: ProviderAccountQuota = {
       accountId: account.id,
-      quota: entry.quota,
+      quota: provider === "anthropic" ? normalizeAnthropicQuota(entry.quota, Date.now()) : entry.quota,
       ...(entry.unavailable ? { unavailable: true as const } : {}),
     };
-  }));
+    if (!explicitAccountReader(provider)) return result;
+    const identity = entry.identity;
+    Object.defineProperty(result, "isCurrent", { value: () => {
+      if (entry.isCurrent) return entry.isCurrent();
+      const credential = getAccountCredential(provider, account.id);
+      return !!credential && (!identity || explicitQuotaIdentity(provider, account.id, providerConfig) === identity);
+    } });
+    return result;
+  });
 }
 
 function normalizedBaseUrl(value: string): string | null {
@@ -1896,10 +2313,10 @@ function parseKimiQuotaPayload(value: unknown): ProviderQuota | null {
   return hasQuotaRows(quota) ? quota : null;
 }
 
-async function resolveKimiQuotaBearer(config: OcxProviderConfig): Promise<string | null> {
+async function resolveKimiQuotaBearer(config: OcxProviderConfig, accountId?: string): Promise<string | null> {
   if (config.authMode === "oauth") {
     try {
-      return await getValidAccessToken("kimi");
+      return accountId ? await getTokenForAccountQuotaProbe("kimi", accountId) : null;
     } catch {
       return null;
     }
@@ -1907,17 +2324,17 @@ async function resolveKimiQuotaBearer(config: OcxProviderConfig): Promise<string
   // ACTIVE key only: silently walking apiKeyPool when the primary env reference is
   // unresolved would render a quota bar for a DIFFERENT account than the one routing
   // requests — a wrong meter is worse than no meter.
-  const primary = resolveEnvValue(config.apiKey)?.trim();
+  const primary = resolveProviderApiKey(config.apiKey)?.trim();
   return primary || null;
 }
 
-async function fetchKimiQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaReport | null> {
+async function fetchKimiQuota(provider: string, config: OcxProviderConfig, accessToken: string): Promise<ProviderQuotaReport | null> {
   // Never release credentials to a user-edited or lookalike provider host.
   if (!isCanonicalKimiCodeBaseUrl(config.baseUrl)) return null;
-  const accessToken = await resolveKimiQuotaBearer(config);
   if (!accessToken) return null;
   const response = await fetch(KIMI_CODE_USAGE_URL, {
     headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` },
+    redirect: "error",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) return null;
@@ -2004,17 +2421,17 @@ async function fetchCommandCodeSpend(
 }
 
 /** OAuth access token or ACTIVE Provider-API key for the Command Code quota probe. */
-async function resolveCommandCodeQuotaBearer(config: OcxProviderConfig): Promise<string | null> {
+async function resolveCommandCodeQuotaBearer(config: OcxProviderConfig, accountId?: string): Promise<string | null> {
   if (config.authMode === "oauth") {
     try {
-      return await getValidAccessToken("command-code");
+      return accountId ? await getTokenForAccountQuotaProbe("command-code", accountId) : null;
     } catch {
       return null;
     }
   }
   // ACTIVE key only: a quota bar for a different account than the one routing
   // requests is a wrong meter, not a helpful one.
-  return resolveEnvValue(config.apiKey)?.trim() || null;
+  return resolveProviderApiKey(config.apiKey)?.trim() || null;
 }
 
 /**
@@ -2022,10 +2439,9 @@ async function resolveCommandCodeQuotaBearer(config: OcxProviderConfig): Promise
  * usage view uses (windowLimits.fiveHour / windowLimits.weekly), plus soft
  * whoami (team orgId scoping) and subscription-scoped spend for creditsUsd.
  */
-async function fetchCommandCodeQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+async function fetchCommandCodeQuota(provider: string, config: OcxProviderConfig, bearer: string): Promise<ProviderQuotaProbeResult> {
   // Never release credentials to a user-edited or lookalike provider host.
   if (!isCanonicalCommandCodeBaseUrl(config.baseUrl)) return null;
-  const bearer = await resolveCommandCodeQuotaBearer(config);
   if (!bearer) return null;
   const whoamiBody = await fetchCommandCodeJson(COMMAND_CODE_WHOAMI_URL, bearer);
   const whoami = asRecord(whoamiBody?.data) ?? whoamiBody;
@@ -2065,13 +2481,7 @@ async function fetchCommandCodeQuota(provider: string, config: OcxProviderConfig
 }
 
 /** Cursor included usage via api2.cursor.sh (Bearer from OAuth) — unofficial, may change. */
-async function fetchCursorQuota(provider: string): Promise<ProviderQuotaReport | null> {
-  let accessToken: string;
-  try {
-    accessToken = await getValidAccessToken("cursor");
-  } catch {
-    return null;
-  }
+async function fetchCursorQuota(provider: string, accessToken: string): Promise<ProviderQuotaReport | null> {
 
   const authHeaders = {
     Accept: "application/json",
@@ -2084,6 +2494,7 @@ async function fetchCursorQuota(provider: string): Promise<ProviderQuotaReport |
   try {
     const periodRes = await fetch("https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage", {
       method: "POST",
+      redirect: "error",
       headers: {
         ...authHeaders,
         "Content-Type": "application/json",
@@ -2152,6 +2563,7 @@ async function fetchCursorQuota(provider: string): Promise<ProviderQuotaReport |
   try {
     const summaryRes = await fetch("https://api2.cursor.sh/api/usage/summary", {
       headers: authHeaders,
+      redirect: "error",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (summaryRes.ok) {
@@ -2181,6 +2593,7 @@ async function fetchCursorQuota(provider: string): Promise<ProviderQuotaReport |
 
   const response = await fetch("https://api2.cursor.sh/auth/usage", {
     headers: authHeaders,
+    redirect: "error",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) return null;
@@ -2267,40 +2680,20 @@ function classifyAntigravityFamily(modelId: string, modelInfo: Record<string, un
 }
 
 function antigravityUsedPercent(quotaInfo: Record<string, unknown>): number | undefined {
-  const remaining = normalizePercent(toFiniteNumber(quotaInfo.remainingFraction) !== undefined
-    ? toFiniteNumber(quotaInfo.remainingFraction)! * 100
-    : toFiniteNumber(quotaInfo.remainingPercentage) !== undefined
-      ? toFiniteNumber(quotaInfo.remainingPercentage)! * 100
+  const target = asRecord(quotaInfo.remaining) ?? quotaInfo;
+  const remaining = normalizePercent(toFiniteNumber(target.remainingFraction) !== undefined
+    ? toFiniteNumber(target.remainingFraction)! * 100
+    : toFiniteNumber(target.remainingPercentage) !== undefined
+      ? toFiniteNumber(target.remainingPercentage)! * 100
       : undefined);
   if (remaining === undefined) return undefined;
   return normalizePercent(100 - remaining);
 }
 
-async function fetchAntigravityQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaReport | null> {
-  const credential = getCredential("google-antigravity");
-  if (!credential?.projectId) return null;
-  let accessToken: string;
-  try {
-    accessToken = await getValidAccessToken("google-antigravity");
-  } catch {
-    return null;
-  }
-  const baseUrl = (config.baseUrl || "https://daily-cloudcode-pa.googleapis.com").replace(/\/+$/, "");
-  const response = await fetch(`${baseUrl}/v1internal:fetchAvailableModels`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "User-Agent": antigravityUserAgent(),
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({ project: credential.projectId }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) return null;
-  const body = asRecord(await readQuotaJson(response));
+/** Gem/Cla windows from a `fetchAvailableModels` body; shared by the provider and account probes. */
+function antigravityWindowsFromModels(body: Record<string, unknown> | null): ProviderQuotaWindow[] {
   const models = asRecord(body?.models);
-  if (!models) return null;
+  if (!models) return [];
 
   const windows = new Map<string, ProviderQuotaWindow>();
   for (const [modelId, rawModelInfo] of Object.entries(models)) {
@@ -2323,10 +2716,249 @@ async function fetchAntigravityQuota(provider: string, config: OcxProviderConfig
     const window = windows.get(label);
     return window ? [window] : [];
   });
+  return customWindows;
+}
+
+/**
+ * Parse Google Antigravity quota from `v1internal:retrieveUserQuotaSummary`.
+ * Groups contain Gemini models and Claude/3P models, each with 5h and weekly limit buckets.
+ */
+function parseAntigravityQuotaSummary(body: Record<string, unknown> | null): ProviderQuota | null {
+  const groups = Array.isArray(body?.groups) ? (body.groups as unknown[]) : [];
+  if (groups.length === 0) return null;
+
+  const customWindowsMap = new Map<string, ProviderQuotaWindow>();
+
+  for (const rawGroup of groups) {
+    const group = asRecord(rawGroup);
+    if (!group) continue;
+    const groupName = `${typeof group.displayName === "string" ? group.displayName : ""} ${typeof group.description === "string" ? group.description : ""}`.toLowerCase();
+    const isGemini = groupName.includes("gemini");
+    const isClaude = groupName.includes("claude") || groupName.includes("3p") || groupName.includes("gpt");
+
+    const buckets = Array.isArray(group.buckets) ? (group.buckets as unknown[]) : [];
+    for (const rawBucket of buckets) {
+      const bucket = asRecord(rawBucket);
+      if (!bucket) continue;
+      const windowStr = `${typeof bucket.window === "string" ? bucket.window : ""} ${typeof bucket.bucketId === "string" ? bucket.bucketId : ""} ${typeof bucket.displayName === "string" ? bucket.displayName : ""}`.toLowerCase();
+      const percent = antigravityUsedPercent(bucket);
+      if (percent === undefined) continue;
+      const resetAt = normalizeResetAt(bucket.resetTime);
+
+      const isWeekly = windowStr.includes("week");
+      const is5h = windowStr.includes("5h") || windowStr.includes("five");
+
+      if (isGemini) {
+        const label = is5h ? "Gem" : isWeekly ? "Gem (Weekly)" : "";
+        if (label && !customWindowsMap.has(label)) {
+          customWindowsMap.set(label, { label, percent, ...(resetAt !== undefined ? { resetAt } : {}) });
+        }
+      } else if (isClaude) {
+        const label = is5h ? "Cla" : isWeekly ? "Cla (Weekly)" : "";
+        if (label && !customWindowsMap.has(label)) {
+          customWindowsMap.set(label, { label, percent, ...(resetAt !== undefined ? { resetAt } : {}) });
+        }
+      } else {
+        const baseLabel = typeof group.displayName === "string" ? group.displayName : "Other";
+        const label = isWeekly ? `${baseLabel} (Weekly)` : baseLabel;
+        if (!customWindowsMap.has(label)) {
+          customWindowsMap.set(label, { label, percent, ...(resetAt !== undefined ? { resetAt } : {}) });
+        }
+      }
+    }
+  }
+
+  const PREFERRED_ORDER = ["Gem", "Gem (Weekly)", "Cla", "Cla (Weekly)"];
+  const customWindows = Array.from(customWindowsMap.values()).sort((a, b) => {
+    const ia = PREFERRED_ORDER.indexOf(a.label);
+    const ib = PREFERRED_ORDER.indexOf(b.label);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.label.localeCompare(b.label);
+  });
+
+  if (customWindows.length === 0) {
+    return null;
+  }
+
+  return {
+    customWindows,
+    updatedAt: Date.now(),
+  };
+}
+
+const ANTIGRAVITY_ACCOUNT_QUOTA_BASE = "https://daily-cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_QUOTA_SUMMARY_URL = `${ANTIGRAVITY_ACCOUNT_QUOTA_BASE}/v1internal:retrieveUserQuotaSummary`;
+const ANTIGRAVITY_QUOTA_MODELS_URL = `${ANTIGRAVITY_ACCOUNT_QUOTA_BASE}/v1internal:fetchAvailableModels`;
+
+/** Only these fixed accounting destinations may use transparent Fake-IP DNS. */
+export function isCanonicalAntigravityQuotaUrl(name: string, url: string): boolean {
+  return name === "google-antigravity"
+    && (url === ANTIGRAVITY_QUOTA_SUMMARY_URL || url === ANTIGRAVITY_QUOTA_MODELS_URL);
+}
+
+let antigravityOutboundDependencies: ProviderOutboundDependencies = {
+  isCanonicalUrl: isCanonicalAntigravityQuotaUrl,
+};
+
+/** Test seam: inject resolver/pinned transport for provider and per-account probes. */
+export function setAntigravityAccountQuotaTransportForTests(dependencies: ProviderOutboundDependencies | null): void {
+  antigravityOutboundDependencies = { ...dependencies, isCanonicalUrl: isCanonicalAntigravityQuotaUrl };
+}
+
+/**
+ * Per-account Antigravity quota (#1082). Always probes Google's own Cloud Code Assist host
+ * through the pinned provider-outbound transport: a configured `baseUrl` is a routing choice
+ * for requests, not a second source of Google's accounting for a stored credential, and fixing
+ * the destination keeps the `provider\0accountId` cache identity exact across config changes.
+ * A redirect or non-2xx yields null (unavailable), never a partial row.
+ */
+export async function fetchAntigravityUsageQuota(accessToken: string, projectId: string): Promise<ProviderQuota | null> {
+  const summaryUrl = ANTIGRAVITY_QUOTA_SUMMARY_URL;
+  try {
+    const summaryResponse = await providerOutboundPost("google-antigravity", { baseUrl: ANTIGRAVITY_ACCOUNT_QUOTA_BASE }, summaryUrl, {
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": antigravityUserAgent(),
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ project: projectId }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, antigravityOutboundDependencies);
+    if (await providerRedirectError(summaryResponse, summaryUrl)) return null;
+    if (summaryResponse.status === 401 || summaryResponse.status === 403) return null;
+    if (summaryResponse.ok) {
+      const quota = parseAntigravityQuotaSummary(asRecord(await readQuotaJson(summaryResponse)));
+      if (quota) return quota;
+    }
+  } catch {
+    // Fallback to fetchAvailableModels on error
+  }
+
+  const url = ANTIGRAVITY_QUOTA_MODELS_URL;
+  const response = await providerOutboundPost("google-antigravity", { baseUrl: ANTIGRAVITY_ACCOUNT_QUOTA_BASE }, url, {
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": antigravityUserAgent(),
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ project: projectId }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }, antigravityOutboundDependencies);
+  if (await providerRedirectError(response, url)) return null;
+  if (!response.ok) return null;
+  const customWindows = antigravityWindowsFromModels(asRecord(await readQuotaJson(response)));
+  if (customWindows.length === 0) return null;
+  return { customWindows, updatedAt: Date.now() };
+}
+
+async function fetchAntigravityQuota(provider: string): Promise<ProviderQuotaReport | null> {
+  const credential = getCredential("google-antigravity");
+  if (!credential?.projectId) return null;
+  let accessToken: string;
+  try {
+    accessToken = await getValidAccessToken("google-antigravity");
+  } catch {
+    return null;
+  }
+
+  // Both probes are pinned to Google's own host through the provider-outbound
+  // transport, mirroring `fetchAntigravityUsageQuota` above: a configured `baseUrl` is a
+  // routing choice for requests, not a second source of Google's accounting, and these
+  // requests carry the account bearer.
+  const summaryUrl = ANTIGRAVITY_QUOTA_SUMMARY_URL;
+  try {
+    const summaryResponse = await providerOutboundPost("google-antigravity", { baseUrl: ANTIGRAVITY_ACCOUNT_QUOTA_BASE }, summaryUrl, {
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": antigravityUserAgent(),
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ project: credential.projectId }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }, antigravityOutboundDependencies);
+    if (await providerRedirectError(summaryResponse, summaryUrl)) return null;
+    if (summaryResponse.status === 401 || summaryResponse.status === 403) return null;
+    if (summaryResponse.ok) {
+      const quota = parseAntigravityQuotaSummary(asRecord(await readQuotaJson(summaryResponse)));
+      if (quota) {
+        return report(provider, "google-antigravity:retrieveUserQuotaSummary", quota);
+      }
+    }
+  } catch {
+    // Fallback on network/fetch error
+  }
+
+  const url = ANTIGRAVITY_QUOTA_MODELS_URL;
+  const response = await providerOutboundPost("google-antigravity", { baseUrl: ANTIGRAVITY_ACCOUNT_QUOTA_BASE }, url, {
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": antigravityUserAgent(),
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ project: credential.projectId }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }, antigravityOutboundDependencies);
+  if (await providerRedirectError(response, url)) return null;
+  if (!response.ok) return null;
+  const customWindows = antigravityWindowsFromModels(asRecord(await readQuotaJson(response)));
   if (customWindows.length === 0) return null;
   return report(provider, "google-antigravity:fetchAvailableModels", {
     customWindows,
     updatedAt: Date.now(),
+  });
+}
+
+type KeyQuotaReader = (name: string, provider: OcxProviderConfig) => Promise<ProviderQuotaProbeResult>;
+
+/** Same selector drives cheap capabilities and uncached reads; never resolves credentials. */
+function keyQuotaReaderForProvider(name: string, provider: OcxProviderConfig): KeyQuotaReader | null {
+  if (provider.disabled === true || (provider.authMode ?? "key") !== "key") return null;
+  if (isCanonicalKimiCodeBaseUrl(provider.baseUrl)) {
+    return async (id, config) => {
+      const bearer = await resolveKimiQuotaBearer(config);
+      return bearer ? fetchKimiQuota(id, config, bearer) : null;
+    };
+  }
+  if (name === "commandcode" && isCanonicalCommandCodeBaseUrl(provider.baseUrl)) {
+    return async (id, config) => {
+      const bearer = await resolveCommandCodeQuotaBearer(config);
+      return bearer ? fetchCommandCodeQuota(id, config, bearer) : null;
+    };
+  }
+  if (registryEntryForProviderDestination(provider)?.id === "opencode-go") return fetchOpenCodeGoQuota;
+  if (isCanonicalA6apiBaseUrl(provider.baseUrl)) return fetchA6apiQuota;
+  if (name === "openrouter" && isCanonicalOpenRouterBaseUrl(provider.baseUrl)) return fetchOpenRouterQuota;
+  if (name === "deepseek" && isCanonicalDeepSeekBaseUrl(provider.baseUrl)) return fetchDeepSeekQuota;
+  if (name === "cline-pass" && isCanonicalClineBaseUrl(provider.baseUrl)) return fetchClineQuota;
+  if (isCanonicalOllamaCloudBaseUrl(provider.baseUrl ?? getProviderRegistryEntry(name)?.baseUrl)) return fetchOllamaCloudQuota;
+  if (["zai", "glm", "glm-cn", "zhipu-bigmodel-coding"].includes(name) && isCanonicalZaiBaseUrl(provider.baseUrl)) return fetchZaiQuota;
+  if (["minimax", "minimax-cn"].includes(name) && isCanonicalMinimaxBaseUrl(provider.baseUrl)) return fetchMinimaxQuota;
+  if (name === "moonshot" && isCanonicalMoonshotBaseUrl(provider.baseUrl)) return fetchMoonshotQuota;
+  if (name === "venice" && isCanonicalVeniceBaseUrl(provider.baseUrl)) return fetchVeniceQuota;
+  if (name === "synthetic" && isCanonicalSyntheticBaseUrl(provider.baseUrl)) return fetchSyntheticQuota;
+  if (name === "deepinfra" && isCanonicalDeepInfraBaseUrl(provider.baseUrl)) return fetchDeepInfraQuota;
+  if (name === "neuralwatt" && isCanonicalNeuralwattBaseUrl(provider.baseUrl)) return fetchNeuralwattQuota;
+  return null;
+}
+
+export function providerApiKeyQuotaMode(name: string, provider: OcxProviderConfig): AccountQuotaMode {
+  return keyQuotaReaderForProvider(name, provider) ? "probe" : "unsupported";
+}
+
+export async function fetchProviderApiKeyQuotas(config: OcxConfig, name: string, forceRefresh = false): Promise<ProviderApiKeyQuota[]> {
+  const provider = config.providers[name];
+  if (!provider || !keyQuotaReaderForProvider(name, provider)) return [];
+  return readProviderApiKeyQuotas(config, name, forceRefresh, async (isolatedProvider, isolatedConfig) => {
+    const result = await maybeFetchProviderQuota(name, isolatedProvider, isolatedConfig, false);
+    if (result === TERMINAL_QUOTA_FAILURE) return { kind: "terminal" };
+    if (result === AUTHORITATIVE_EMPTY_QUOTA) return { kind: "empty" };
+    return result ? { kind: "quota", quota: result.quota } : { kind: "unavailable" };
   });
 }
 
@@ -2342,80 +2974,106 @@ async function maybeFetchProviderQuota(
     if (isBuiltInChatGptForwardProvider(name, provider)) {
       return fetchChatGptForwardQuota(config, name, provider, forceRefresh, prefetchedCodexSnapshot);
     }
-    if (provider.authMode === "oauth" && name === "xai") return fetchXaiQuota(name);
+    if (provider.authMode === "oauth" && explicitAccountReader(name)) return await fetchExplicitCurrentQuota(name, provider, config);
     if (provider.authMode === "oauth" && name === "anthropic") return fetchAnthropicQuota(name);
-    if (provider.authMode === "oauth" && name === "cursor") return fetchCursorQuota(name);
-    if (provider.authMode === "oauth" && name === "google-antigravity") return fetchAntigravityQuota(name, provider);
+    if (provider.authMode === "oauth" && name === "google-antigravity") return await fetchAntigravityQuota(name);
     if (provider.authMode === "oauth" && name === "kiro") return fetchKiroQuota(name);
-    // Kimi Code `/usages` accepts OAuth or coding-plan API keys, but only on the canonical
-    // host and only for real key auth — forward/local modes carry no credential of ours.
-    if (provider.authMode === "oauth" && name === "kimi") return fetchKimiQuota(name, provider);
-    if (provider.authMode === "key" && isCanonicalKimiCodeBaseUrl(provider.baseUrl)) {
-      return fetchKimiQuota(name, provider);
-    }
-    // OAuth account login or Provider-API key only; forward/local modes carry no
-    // credential of ours on the canonical host.
-    if (provider.authMode === "oauth" && name === "command-code") {
-      return fetchCommandCodeQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "commandcode"
-      && isCanonicalCommandCodeBaseUrl(provider.baseUrl)) {
-      return fetchCommandCodeQuota(name, provider);
-    }
-    // Identify OpenCode Go by where it routes, not by what the row is called. Multi-account
-    // setups keep the same destination under names like `opencode-go-2` (#1924), and those rows
-    // silently had no quota panel and no `ocx provider quota --json` report while the literal
-    // name was the gate. `registryEntryForProviderDestination` is the existing predicate for
-    // exactly this question: normalized endpoint + adapter + key auth, so a canonical URL behind
-    // a different adapter is still not OpenCode Go. The defensive URL check inside
-    // `fetchOpenCodeGoQuota` stays — sending a key anywhere must not depend on this gate.
-    if ((provider.authMode ?? "key") === "key" && registryEntryForProviderDestination(provider)?.id === "opencode-go") {
-      return fetchOpenCodeGoQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && isCanonicalA6apiBaseUrl(provider.baseUrl)) {
-      return fetchA6apiQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "openrouter") {
-      return fetchOpenRouterQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "deepseek") {
-      return fetchDeepSeekQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && registryEntryForProviderDestination(provider)?.id === "cline-pass") {
-      return fetchClineQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key"
-      && (name === "zai" || name === "glm" || name === "glm-cn" || name === "zhipu-bigmodel-coding")) {
-      return fetchZaiQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && (name === "minimax" || name === "minimax-cn")) {
-      return fetchMinimaxQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "moonshot") {
-      return fetchMoonshotQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "venice") {
-      return fetchVeniceQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "synthetic") {
-      return fetchSyntheticQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "deepinfra") {
-      return fetchDeepInfraQuota(name, provider);
-    }
-    if ((provider.authMode ?? "key") === "key" && name === "neuralwatt") {
-      return fetchNeuralwattQuota(name, provider);
-    }
-    // Ollama Cloud rows are identified by DESTINATION, not by name: multi-account
-    // setups keep the same endpoint under names like `ollama-mimikkai`, and the
-    // canonical check inside the fetcher refuses to send the key to lookalike hosts.
-    if ((provider.authMode ?? "key") === "key" && isCanonicalOllamaCloudBaseUrl(provider.baseUrl)) {
-      return fetchOllamaQuota(name, provider);
-    }
-    return null;
+    // Passive providers (meta-muse): Meta publishes no quota endpoint, so there is no
+    // probe to run — the row is the active account's last in-band observation.
+    if (provider.authMode === "oauth" && hasPassiveAccountQuota(name)) return fetchPassiveProviderQuota(name);
+    const reader = keyQuotaReaderForProvider(name, provider);
+    return reader ? reader(name, provider) : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Hand freshly committed provider reports to the optional quota-reset observer.
+ *
+ * Lazy import on purpose: this module is statically reachable from
+ * src/server/responses/core.ts (via oauth/anthropic-routing.ts), so a static edge would put
+ * the observer and its sink registry on every install's request path.
+ *
+ * No previous snapshot is passed. The observer keeps its own persisted last-seen map,
+ * because `previous` here is bound only when `cache.key === key` and the key digest at
+ * cacheKeyWithAggregationState includes quota values and updatedAt — so it is empty exactly
+ * when a reset happened.
+ *
+ * Account identity is resolved SYNCHRONOUSLY, before any await. Two reasons, both observed:
+ * pool failover rewrites `activeAccountId` during request routing
+ * (promoteAnthropicActiveAccount -> setActiveAccount), so a 429 between this commit and a
+ * later async read would attribute this report to a different account and overwrite that
+ * account's baseline with these numbers. fetchAnthropicQuota already captures
+ * `probedAccountId` before awaiting for exactly this reason; the observer must not be
+ * sloppier than the cache it observes.
+ *
+ * Observations are serialized through a module-level promise chain for the same reason as
+ * the codex seam: Bun does not resolve concurrent import() calls in call order, and an
+ * out-of-order baseline swap manufactures false resets that then burn the durable
+ * idempotence key.
+ */
+let pendingProviderObservation: Promise<void> = Promise.resolve();
+
+/**
+ * Stable per-account observation key for one provider report.
+ *
+ * OAuth providers key by active account id. Key-auth providers have NO account set, so
+ * every key in `apiKeyPool` would collapse onto "default" and rotating from a spent key to
+ * a fresh one would read as a reset (measured: 97% -> 12% fired a false surprise). The
+ * cache key already discriminates these at cacheKey() via apiKeyPoolEntryId, so this
+ * mirrors that discriminator instead of inventing a second notion of identity.
+ */
+function providerObservationAccountKey(provider: string, config: OcxConfig): string {
+  const oauthAccountId = getAccountSet(provider)?.activeAccountId;
+  if (oauthAccountId !== undefined) return `${provider}\u0000${oauthAccountId}`;
+  const providerConfig = config.providers[provider];
+  const resolvedKey = typeof providerConfig?.apiKey === "string"
+    ? resolveEnvValue(providerConfig.apiKey)?.trim()
+    : undefined;
+  const keyId = resolvedKey ? apiKeyPoolEntryId(resolvedKey) : "default";
+  return `${provider}\u0000key:${keyId}`;
+}
+
+/** Test-only view of the observation account key. */
+export function providerObservationAccountKeyForTests(provider: string, config: OcxConfig): string {
+  return providerObservationAccountKey(provider, config);
+}
+
+function notifyProviderQuotaSnapshot(
+  reports: ReadonlyArray<ProviderQuotaReport>,
+  config: OcxConfig,
+): void {
+  if (reports.length === 0) return;
+  // Resolved here, synchronously, while the identity is still the one that produced these
+  // reports.
+  const observations = reports.map(report => ({
+    scope: report.provider,
+    accountKey: providerObservationAccountKey(report.provider, config),
+    quota: report.quota,
+  }));
+  pendingProviderObservation = pendingProviderObservation
+    .then(async () => {
+      const observer = await import("../quota/reset-observer");
+      if (!observer.hasQuotaResetSink()) return;
+      const { providerWindowObservations } = await import("../quota/window-mapping");
+      for (const observation of observations) {
+        observer.observeQuotaSnapshot({
+          scope: observation.scope,
+          accountKey: observation.accountKey,
+          windows: providerWindowObservations(observation.quota),
+        });
+      }
+    })
+    .catch(() => {
+      // Detection is best-effort: a quota refresh must never fail because of it. Swallowing
+      // here also keeps the chain alive — a rejected link would poison every later one.
+    });
+}
+
+/** Await the observation chain. Tests only: production never needs to join it. */
+export function flushProviderQuotaObservationsForTests(): Promise<void> {
+  return pendingProviderObservation;
 }
 
 export async function fetchProviderQuotaReports(config: OcxConfig, forceRefresh = false): Promise<ProviderQuotaResponse> {
@@ -2430,9 +3088,14 @@ export async function fetchProviderQuotaReports(config: OcxConfig, forceRefresh 
   const now = Date.now();
   // The cache fast path must not extend a preserved last-good row past its 30-minute bound:
   // a row preserved at age 29:59 plus a full 5-minute TTL would otherwise serve until ~35min.
+  // An OBSERVED row is exempt: it carries the observation time, which is older than the bound
+  // by construction and never becomes fresher on its own. Without the exemption a single
+  // configured passive provider makes this predicate permanently false, so every dashboard
+  // poll re-probes every OTHER provider upstream instead of serving the 5-minute cache.
   const cacheFresh = cache && cache.key === key && now - cache.ts < CACHE_TTL_MS
     && cache.response.reports.every(item =>
-      now - item.updatedAt < LAST_GOOD_MAX_AGE_MS && isProviderQuotaReportCurrent(item));
+      (item.observed === true || now - item.updatedAt < LAST_GOOD_MAX_AGE_MS)
+      && isProviderQuotaReportCurrent(item));
   if (!forceRefresh && cacheFresh) return cache!.response;
   const joinable = inflight.get(key);
   if (!forceRefresh && joinable && joinable.epoch === invalidationEpoch) return joinable.promise;
@@ -2476,7 +3139,9 @@ export async function fetchProviderQuotaReports(config: OcxConfig, forceRefresh 
     const byProvider = new Map<string, ProviderQuotaReport>();
     const generationMismatchedProviders = new Set<string>();
     for (const item of previous) {
-      if (item.updatedAt < cutoff) continue;
+      // Same exemption as the fast path. A passive row reaching `previous` is not a probe
+      // that went quiet — there is no probe — so age cannot condemn it.
+      if (item.observed !== true && item.updatedAt < cutoff) continue;
       if (isProviderQuotaReportCurrent(item)) byProvider.set(item.provider, item);
       else generationMismatchedProviders.add(item.provider);
     }
@@ -2505,6 +3170,7 @@ export async function fetchProviderQuotaReports(config: OcxConfig, forceRefresh 
       const reports = response.reports.filter(item => mayCommitProviderQuotaKey(item.provider, writerGeneration));
       cache = { key, ts: Date.now(), response: { ...response, reports } };
       replaceCachedProviderQuotas(reports);
+      notifyProviderQuotaSnapshot(reports, config);
     }
     return response;
   })();

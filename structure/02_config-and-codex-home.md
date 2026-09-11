@@ -20,6 +20,34 @@ $CODEX_HOME/.opencodex-native-main-profiles/
 Never assume macOS-only paths. Windows, service installs, and app-launched Codex can all depend on
 the resolved `CODEX_HOME`.
 
+Journal restoration compares config and profile independently against their saved originals and
+recorded injected hashes. If either changed artifact lacks its injected hash, the config/profile
+pair and journal remain untouched and the result is explicitly unverified; callers must not
+convert that refusal into successful fallback cleanup. Already-original bytes need no rewrite,
+and absence is distinct from an empty file. The injector checks a retained hashless journal against
+the same `baselineContent` it snapshots, plus the current profile, before writing or assigning a new
+injected hash. Native content can establish a fresh snapshot; routed content cannot promote an
+unverified older original. Existing hash-backed edit preservation and external-provider opt-out
+remain separate paths.
+
+The source-built Docker image explicitly keeps `CODEX_HOME=/home/bun/.codex` separate
+from `OPENCODEX_HOME=/home/bun/.opencodex`. Compose persists them in `codex-state` and
+`ocx-state` respectively, retaining a read-only root. The image creates owner-only
+writable homes for `bun`; existing volume ownership and permissions are not repaired.
+The catalog resolver is unchanged; a writable empty home is not a materialized catalog.
+
+[Decision Log]
+- 목적과 의도: Make the container's catalog location persistent and writable without changing native home semantics.
+- 기존 구현 및 제약 조건: Compose persisted only the OCX home, leaving Codex state on a read-only root; both products use incompatible auth.json formats.
+- 검토한 주요 대안: Merge the homes, nest Codex under an existing volume with a new startup initializer, or persist the existing separate Codex home.
+- 선택한 방식: Add a separate codex-state volume and create both owner-only directories in the image.
+- 다른 대안 대신 이 방식을 선택한 이유: It preserves existing paths, avoids credential-file collisions, and works when an older ocx-state volume hides the image's seeded directory tree.
+- 장점, 단점 및 영향: Two volumes must be backed up, but no automatic credential migration or runtime resolver change is needed. Catalog import/materialization remains an explicit prerequisite.
+
+`docker compose down` retains both volumes. `docker compose down --volumes` deletes
+both `ocx-state` and `codex-state`, including their credentials and catalog/state;
+treat it as destructive, not as an upgrade or restart command.
+
 Service install-state ownership uses this same resolver. In WSL, an unset `CODEX_HOME` may resolve
 to the single discoverable Windows Desktop home; recording Linux `~/.codex` instead would make a
 later repair or uninstall look foreign even though the service and runtime were started from the
@@ -126,6 +154,12 @@ Storage cleanup run metadata uses the field-scoped persisted-config mutation pat
 Worker cannot restore unrelated API keys or provider settings from a snapshot read before the lock.
 If that metadata write is unavailable after cleanup has already completed, the job retains the
 cleanup outcome and exposes a bounded persistence error instead of relabeling the run as a Worker failure.
+
+Cleanup manifests and satellite backups share the stage-local atomic publisher: an exclusive
+private temporary file is fully written and file-synced before the existing Windows-tolerant
+rename replaces the destination. Handled publication failures retain the previous record;
+directory syncing remains best-effort. This does not make a partial permanent purge reversible:
+restore still fails closed when a recorded logical entry has no surviving file.
 
 Windows secret-file hardening resolves the effective token SID through an absolute, trusted
 PowerShell path before granting the owner and removing inherited broad ACL entries. The normal
@@ -249,6 +283,23 @@ to snapshot persistence instead of relying on the progress argument alone.
 
 ### OpenCodex home and live process state
 
+`initializePersistedConfigIfMissing` in `src/config.ts` is the create-only path consumed by
+`src/cli/init.ts`. It rechecks absence under the existing config-mutation lock and publishes through
+`src/config/initialize.ts`: a private descriptor is hardened before secret bytes are written, then
+linked without replacing an occupied destination. Existing invalid or unsafe entries are preserved.
+The initializer never truncates a staged inode or rolls back by unlinking the destination; cleanup
+only removes its own temporary name. Unsupported/denied links and incomplete cleanup fail explicitly,
+and publication followed by a later failure can leave a complete config or private residue. Ordinary
+`saveConfig` replacement behavior remains unchanged. This protects init-time config bytes, not a
+foreign winner's ownership under future uninstall; the existing ownership manifest and global CLI
+shim preflight keep their separate contracts.
+
+Initial publication diagnostics distinguish required permission-hardening failures from denied
+hard-link publication without exposing raw filesystem causes. Both identify `OPENCODEX_HOME`
+as the supported-location recovery path; uncertain publication and cleanup warnings remain in
+the CLI. The quickstart documents inspection before retry, private-permission requirements,
+and fresh-location examples. Diagnostics do not introduce a fallback or alter file I/O ordering.
+
 `src/config/paths.ts` is the single owner of `OPENCODEX_HOME` expansion and resolution. It exposes
 the config directory and `config.json` path and retains the existing cache rule: a relative home is
 resolved once for each distinct raw environment value, so a later working-directory change cannot
@@ -260,7 +311,7 @@ identity, and snapshot-guarded removal. `RuntimePortState.attestationSecret` rem
 owner-only state and is validated before a record is returned. `src/config.ts` re-exports the same
 symbols for compatibility, but new lifecycle-only callers import the process-state leaf directly.
 
-Both config and process-state writes use `src/config/atomic-write.ts`. The leaf preserves the shared
+Replacing config and process-state writes use `src/config/atomic-write.ts`. The leaf preserves the shared
 process-wide temp sequence, symlink target resolution, real-home test guard, owner manifest,
 Windows ACL hardening, scrub-before-unlink failure path, and explicit residual-temp errors. A caller
 must not replace it with a local temp-and-rename shortcut.
@@ -280,7 +331,7 @@ matters for maintainers is which groups exist and who resolves them:
 | --- | --- | --- |
 | Listener | `port`, `hostname` | The listener owns the port; `runtime-port.json` reports where it actually landed. |
 | Routing | `defaultProvider`, `providers`, per-provider `selectedModels` | Explicit `provider/model` wins over `defaultProvider`. |
-| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
+| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, per-provider `modelDisplayNames`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. Exact provider model display names are durable display only overlays. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
 | Retained state | `appOwnedMemoryBudgetMb` | Process-wide eviction target for app-owned logs, caches, blobs, and continuation payloads. Default 256 MiB, valid 64..4096; pinned state may temporarily exceed the target, but every pin-capable store has a finite local cap and their documented aggregate stays below `APP_OWNED_WORST_CASE_PINNED_BYTES` (512 MiB). Neither value caps RSS or native runtime memory. |
 | Transport | stream mode, timeouts, proxy settings, `websockets`, `emptyCompletionRetry` | `streamMode` persists in config.json; Windows services need a persisted input, and macOS uses it for explicit eager-relay opt-in. Empty-completion replay is an explicit top-level opt-in because its second upstream request may be billable. |
 | Credentials | `apiKeys` | Data-plane only; never admitted to `/api/*`. |
@@ -309,6 +360,12 @@ explicitly runs legacy OpenAI recovery. A user-owned root `openai_base_url` is p
 overwritten, and that case also blocks managed sub-agent defaults rather than fighting the user for
 ownership.
 
+Client-compaction mode can retain that user-owned root URL alongside an injected provider table.
+Its status must distinguish ownership from destination: an unmarked user-owned line may already
+point to this proxy. Report that existing `openai` threads follow the configured root URL and new
+threads use the injected table, without inferring a foreign endpoint or prescribing URL removal.
+This diagnostic distinction does not change URL ownership, journal entries, or session history.
+
 **API auth header (non-loopback).** The built-in `openai` provider cannot carry the
 `x-opencodex-api-key` env header, so this form re-tags the root provider and appends the table:
 
@@ -327,6 +384,21 @@ env_key = "OPENCODEX_API_AUTH_TOKEN"
 Root TOML keys must be written before the first `[table]`. Re-injection strips the stale form of
 both shapes — opencodex blocks, injected root base-url overrides, stale root context-window
 overrides, and stale catalog paths — before rewriting, so switching between forms leaves no residue.
+
+Read-only doctor and project-routing diagnostics use a lightweight root/table TOML reader rather
+than mutating or normalizing the user's file. That reader must lexically skip both basic and literal
+multiline string bodies: instruction prose can contain key-shaped examples and `[table]` snippets,
+which are data rather than configuration. Diagnostic result objects may retain the real path for
+local correlation, but every formatted doctor line must pass it through the shared user-path
+redaction boundary before display.
+
+[Decision Log]
+- 목적과 의도: Keep strict-config diagnostics useful without interpreting instruction prose as TOML or exposing OS account names in shareable output.
+- 기존 구현 및 제약 조건: The diagnostic reader intentionally covers only Codex root keys and tables; a full TOML dependency is not otherwise required.
+- 검토한 주요 대안: Add a full TOML parser, scan raw lines for one legacy key, or preserve the lightweight parser with multiline lexical state.
+- 선택한 방식: Preserve the bounded reader, skip multiline string bodies before key/table matching, and redact paths only at the formatting boundary.
+- 다른 대안 대신 이 방식을 선택한 이유: All consumers keep one root/table interpretation while internal diagnostics retain actionable local paths.
+- 장점, 단점 및 영향: False positives and username disclosure are removed; unsupported exotic TOML syntax remains outside this diagnostic reader's contract.
 
 Native Codex sub-agent defaults are a separate, explicit opt-in. When
 `syncCodexSubagentDefaults` is true and `injectionModel` is set, injection writes marker-owned
@@ -436,3 +508,7 @@ uninstall with their exact paths.
 Legacy nonempty config directories are deliberately not retroactively claimed. If either ownership
 file is missing, malformed, or bound to another root, uninstall refuses config deletion and reports
 the residual directory for manual review; there is no recursive-delete fallback.
+
+## Remote client key files
+
+Client connection metadata stores a stable `apiKeyId` and a non-secret rotation `pendingOperation`. The current data secret remains only in `service-api-token`; a bounded rotation temporarily keeps the old secret in owner-only `service-api-token.prev`. Commit or recovery clears the marker before orphan cleanup. `ocx disconnect` is local-only and leaves remote revocation to the hub's **Integrations → API Keys** page. Hub and local usage stores are not mirrored.
