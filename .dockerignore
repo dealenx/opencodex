@@ -22,4 +22,22 @@ gui/node_modules/
 gui/dist/
 gui/.vite/
 
+!gui/package.json
+!gui/bun.lock
+
+# Nixpacks (Dokploy/Railway) generates its build plan in .nixpacks/ at the repo
+# root on the build host, then builds a Docker image from that context. The
+# whitelist above would exclude it and fail the COPY with "not found".
+!.nixpacks/
+!.nixpacks/**
+
+!bin/
+!bin/**
+!gui/dist/
+!gui/dist/**
+!gui/vite.config.ts
+!gui/tsconfig.json
+!gui/tsconfig.app.json
+!gui/tsconfig.node.json
+!gui/index.html
 **/*.log
