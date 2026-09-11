@@ -86,39 +86,29 @@ export const LIVE_CLIENT_PROTOCOL_HEADERS = [
  *
  * When `OCX_LIVE_FRAME_LOG` is set to a file path, every relayed sideband frame appends one
  * JSONL record: direction, frame kind, byte length, and whether the payload contains U+FFFD.
- * Privacy: full frame payloads are never written — only when U+FFFD is present, a short
- * excerpt around the first replacement character is included so the corruption point can be
- * attributed (upstream vs relay vs client). Disabled entirely when the env var is unset.
+ * Privacy: no frame content is written, including excerpts around replacement characters.
+ * For binary frames, U+FFFD may also be introduced by UTF-8 decoding; the flag alone does not
+ * identify the source of corruption. Disabled entirely when the env var is unset.
  */
 export const LIVE_FRAME_LOG_ENV = "OCX_LIVE_FRAME_LOG";
-const LIVE_FRAME_LOG_CONTEXT_CHARS = 24;
-
-function fffdContext(text: string): string | undefined {
-  const idx = text.indexOf("\uFFFD");
-  if (idx < 0) return undefined;
-  const start = Math.max(0, idx - LIVE_FRAME_LOG_CONTEXT_CHARS);
-  const end = Math.min(text.length, idx + LIVE_FRAME_LOG_CONTEXT_CHARS);
-  return text.slice(start, end);
-}
-
 export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
   const logPath = process.env[LIVE_FRAME_LOG_ENV];
   if (!logPath) return;
   try {
     let kind: "text" | "binary" = "binary";
     let bytes = 0;
-    let context: string | undefined;
+    let fffd = false;
     if (typeof data === "string") {
       kind = "text";
       bytes = Buffer.byteLength(data);
-      context = fffdContext(data);
+      fffd = data.includes("\uFFFD");
     } else if (data instanceof ArrayBuffer) {
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(new Uint8Array(data)));
+      fffd = new TextDecoder().decode(new Uint8Array(data)).includes("\uFFFD");
     } else if (ArrayBuffer.isView(data)) {
       const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(view));
+      fffd = new TextDecoder().decode(view).includes("\uFFFD");
     } else {
       return;
     }
@@ -127,8 +117,7 @@ export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
       dir,
       kind,
       bytes,
-      fffd: context !== undefined,
-      ...(context !== undefined ? { context } : {}),
+      fffd,
     };
     appendFileSync(logPath, `${JSON.stringify(record)}\n`);
   } catch {
@@ -146,6 +135,20 @@ function clientProtocolHeaders(reqHeaders: Headers): Record<string, string> {
 }
 
 const LIVE_CALL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Decode one path-segment call id. A malformed percent escape (`%ZZ`) makes
+ * `decodeURIComponent` throw; that must read as "not a sideband target" (JSON 404),
+ * never escape the router as a 500.
+ */
+function decodeLiveCallId(segment: string): string | null {
+  try {
+    const callId = decodeURIComponent(segment);
+    return LIVE_CALL_ID_RE.test(callId) ? callId : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Credential-shaped query keys never forwarded upstream on a standalone realtime
@@ -238,8 +241,8 @@ function httpsToWss(httpUrl: string): string {
 export function parseLiveSidebandTarget(pathname: string, searchParams: URLSearchParams, rawQuery = ""): LiveSidebandTarget | null {
   const liveMatch = pathname.match(/^\/v1\/live\/([^/]+)\/?$/);
   if (liveMatch) {
-    const callId = decodeURIComponent(liveMatch[1]!);
-    if (!LIVE_CALL_ID_RE.test(callId)) return null;
+    const callId = decodeLiveCallId(liveMatch[1]!);
+    if (!callId) return null;
     return { style: "frameless-path", callId };
   }
   // Standalone Frameless session (no call-create): `GET /v1/live?model=`.
@@ -248,8 +251,8 @@ export function parseLiveSidebandTarget(pathname: string, searchParams: URLSearc
   }
   const callsMatch = pathname.match(/^\/v1\/realtime\/calls\/([^/]+)\/?$/);
   if (callsMatch) {
-    const callId = decodeURIComponent(callsMatch[1]!);
-    if (!LIVE_CALL_ID_RE.test(callId)) return null;
+    const callId = decodeLiveCallId(callsMatch[1]!);
+    if (!callId) return null;
     return { style: "realtime-calls-path", callId };
   }
   if (pathname === "/v1/realtime" || pathname === "/v1/realtime/") {

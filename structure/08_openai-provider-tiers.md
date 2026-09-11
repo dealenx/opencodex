@@ -18,6 +18,39 @@ engine. Direct short-circuits that engine before pool state is read or mutated a
 current caller/main-login bearer. Neither mode may fall through to `openai-apikey`, and the API
 provider may not fall through to Codex-login credentials.
 
+Caller credentials stay scoped to the selected physical route. Typed proxy admission survives
+Combo/policy recursion, but raw Authorization and ChatGPT account headers are removed from
+rebuilt requests at those selections or actual shadow/thread-spawn rewrites. An original caller's
+Direct credential — a clean non-proxy bearer carrying a locally decoded ChatGPT account claim
+(routing evidence, not signature verification), with any explicit account header matching that
+claim — is captured separately and may be
+restored only for the final canonical OpenAI route, under the existing Direct/Pool, native-main
+claim, and entitlement rules. This restore is deliberately stricter than unchanged-route Direct
+forwarding, which keeps its legacy rules. The stricter explicit-pair snapshot (JWT with matching account
+header) additionally feeds optional OpenAI sidecars and is also
+withheld from an unchanged keyless Cursor route; an independently supplied Cursor bearer
+remains supported. A noncanonical caller-auth transport keeps only a clean single bearer with
+no ChatGPT account claim: a bearer carrying a ChatGPT account claim, a combined or malformed
+Authorization value, and the chatgpt-account-id header are withheld from it. Key-auth and noncanonical routes use
+their own configured key or provider-owned OAuth credential. Canonical unqualified `openai`
+forwarding preserves the sanitized caller/main-login bearer in Direct mode and may select a
+stored native credential in Pool mode. An explicit account-qualified sidecar may select its
+stored account even when the provider default is Direct. A thread-spawn marker without a rewrite
+preserves the caller credential. Bearer admission can still select stored native credentials under
+the existing turn claim. Claude replay may reconstruct its claimed main snapshot only for a final canonical
+ChatGPT target. Alternate-account retry retains the sanitized caller input separately from the
+selected Pool headers, so neither a discarded source bearer nor a Pool token becomes caller-main
+authority during retry.
+
+Explicit OpenAI sidecar authentication is retained separately in request-local memory before
+Combo or policy headers are rewritten. Only the canonical sidecar resolver can restore that
+single bearer and matching explicit account pair; it revalidates the existing credential and
+destination rules. A recorded absence is not recaptured from a later provider request, and
+combined Authorization values are rejected. This snapshot never becomes primary-provider or
+alternate-main retry authentication; the original caller's native snapshot is separate.
+Optional Chat/Claude stored-main enrichment still requires
+the native-main turn claim.
+
 The two routes also keep separate request-compatibility contracts. The canonical ChatGPT Codex
 forward destination removes public `prompt_cache_options` because that backend rejects the field
 before inference; `prompt_cache_key` remains supported. `openai-apikey` and noncanonical/custom
@@ -72,6 +105,111 @@ requests keep their captured credential. An all-paused pool fails closed.
 The dashboard's bulk pause action refreshes all account quotas and mutates only accounts whose
 plan-relevant window is freshly confirmed at exactly 100%; unknown and failed refreshes are skipped.
 
+A confirmed manual reset-credit consumption may immediately reconcile that account's
+eligible pre-existing ordinary reset-derived cooldown after a complete, non-exhausted usage
+observation started after the reset. Paused or reauthentication-required accounts and
+cooldowns held by another in-flight probe remain excluded; their cooldowns are retained.
+Recovery owns the specific cooldown and authenticates
+main and added Pool accounts through their respective credential contracts. Main usage
+publication keeps the latest successfully published observation authoritative. Pool recovery
+across a credential refresh requires the actual self/joined refresh lineage, not matching
+replacement timestamps. It preserves
+newer failures, independent Spark/Reserve scopes, explicit Retry-After, pause, pin and
+selection state. Replay and `already_redeemed` are not new-reset evidence. Failed usage
+recovery leaves the cooldown in place and preserves the confirmed consume success;
+retrying usage must not require another credit.
+
+`codexQuotaAutoRefresh` is a separate default-off spending intent. For each explicitly enabled
+account/window, the one-minute state sweep compares the cached upstream reset timestamp, sends the
+existing minimal non-stored warmup through that exact account once the timestamp is due, then
+field-patches the completed timestamp. The next observed reset boundary is also retained in
+`nextFiveHourResetAt` / `nextWeeklyResetAt` until completed; later idle-window metadata cannot
+postpone it. Successful warmups publish quota headers under the captured credential/identity fence.
+For opted-in accounts only, stale metadata is refreshed at most once per five minutes through
+the existing WHAM recovery path, independently of dashboard traffic or reset notifications.
+Inference 401s quarantine the rejected credential; failures log an opaque label and safe reason.
+Paused or reauthentication-required
+accounts are skipped, simultaneous 5-hour/weekly resets share one warmup, transient failures retry
+after five minutes, and account deletion removes its setting and completion markers.
+Main-account hard-lock also gates these billable warmups. A policy/identity skip changes neither
+completion markers nor retry delay; quota reads remain available. Main refresh completes before
+shared credential ownership, then prepared credentials and restrictions are rechecked. Lifecycle
+cleanup uses the dependency-free quota-auto-refresh state leaf, avoiding a reconciliation cycle.
+
+The account-pool dashboard exposes one bulk control under Advanced settings, not per-card
+rows. It applies both reported 5-hour and weekly windows to every current main/added account;
+new accounts do not inherit opt-in. The existing granular settings API remains authoritative.
+UI writes are serialized, followed by a settings read; partial failures preserve the intended
+ON/OFF action for explicit retry. OFF also clears unavailable windows with stale enabled flags.
+
+Exact `gpt-reserve` has a separate process-local quota scope. Only global/default and shared
+ordinary scopes can receive a generic quota-recovery claim; ordinary success cannot clear Reserve.
+Effective Desktop authless compatibility adds only configured main-selector Reserve catalog rows,
+never global/native/API-key or added-account discovery. Prefer observed Reserve metadata; a
+Luna-derived fallback is explicitly marked and never becomes an observed native source on resync.
+Loopback injection and catalog eligibility share the pure `loopback-target` predicates.
+Runtime eligibility is separate: only trusted receiving-listener admission with source loopback,
+the opt-in flag and non-client role activates compatibility. A secondary listener's existence does
+not affect public ingress. Admission flows through Responses, compact, WS handshake/turns,
+translated replay and helper planning; missing admission is not inferred from a URL or Host header.
+Claude's replay keeps its existing sidecar/routing overrides but passes the original live policy
+reference separately. Policy flags/role/pause remain current through materialization and dispatch;
+the replay snapshot must not hide a policy change while a send waits for pacing.
+
+Reserve availability belongs to `reserve-availability`, not the catalog. An already-owned main
+token/writer makes a capability-aware fixed WHAM GET, bounded to8s/64KiB. Ordinary disallowed,
+Luna Reserve banner and exactly one allowed Reserve bucket are all required. Optional account/user
+echoes must match. The max60s grant and single-flight are bound privately to the exact credential,
+identity generation and a WeakMap-backed proof; refresh, revocation or identity replacement cannot
+reuse a spread/copied proof. Passive usage only revokes. Ordinary quota publication uses an injected
+callback to the existing validated parser/store; no runtime import of the quota/config facade is
+introduced into this leaf. Quota types live in `quota-types` to avoid a cache/facade type cycle.
+Final materializers require proof based on the exact model plus transport-scoped live config,
+including custom-named canonical-forward routes that synthesize a main context. The injected
+transport guard rechecks actual headers after pacing, at every HTTP attempt and WebSocket create;
+expiry/revocation fails closed without renewal inside a send. Nested retry evidence preserves local
+policy errors instead of recording a network failure. A missing proof does not fall through to
+ordinary Luna or another account. Native vision/search helpers and standalone search refuse Reserve
+under this compatibility opt-in; ordinary helper/default behavior is unchanged.
+Upstream remains the entitlement authority.
+
+`codexMainAccountHardLock` is a separate opt-in local admission policy, off by default.
+It blocks newly admitted identity-matched main-account requests at 99% of the 5h/short window
+when present, otherwise the weekly window (monthly for monthly-only accounts). It does not take
+the maximum across those windows. Pool alternatives remain eligible; explicit main selection and stored Direct
+substitution do not override it. It neither pauses the account nor clears upstream cooldown/reauth
+state, and management quota refresh remains available. Only a fresh valid reading below 99%, including
+0%, releases a measured block; passing a reset timestamp alone does not. While blocked, the existing
+once-per-minute background sweep refreshes owned main usage, with bounded/coalesced reads and no
+inference or reset-credit consumption. Failed, missing, non-finite or out-of-range readings do not
+release the block. Policy validation precedes legacy clamping. Supplementary monthly data cannot
+become the fallback governing window without a monthly-only plan or explicit primary-monthly evidence.
+Previously unobserved usage is unknown, not fabricated headroom.
+
+The policy reads a separately retained identity-tagged quota snapshot, so the legacy rotation
+cache's six-hour expiry does not silently release a known block. A confirmed account transition
+invalidates old evidence. Request-owned bearers are matched only against a credential and effective
+workspace already observed under native ownership; an unrelated or unmatched keyring credential
+is not attributed to stored main and introduces no physical-main read. Credential equality tags
+remain process-local and never enter disk, logs, or management DTOs.
+
+When protection is enabled, owned startup rebuilds this binding from its pinned auth path under
+the native owner and exclusive claim, after journal recovery and stage cleanup, before publishing
+ready. Caller-owned Direct, exact-main, fallback, and main-pin admission stays temporarily fenced
+during that initialization; stored Pool alternatives remain eligible. Foreign/unknown service-home
+paths neither initialize the binding nor trigger an ownership reprobe from caller-owned admission.
+A new listener with protection enabled rearms the same guarded path on an existing ready lifecycle,
+including when the physical credential was replaced after the earlier listener started.
+Failed initialization creates no new binding. A previously verified same-process binding and its
+safety state remain until a valid replacement observation or confirmed account transition; malformed
+or conflicting input alone is not replacement evidence.
+
+This is not a reservation of the last 1%: already-admitted, parallel, unmatched-keyring, or direct
+upstream traffic can still reach exhaustion. While blocked, main cannot use Luna reserve either.
+Keeping ordinary usage below exhaustion may prevent Reserve activation; the policy never changes
+OpenAI's Reserve grants or `ordinary_usage_allowed` response. Settings and the main-account DTO
+report enabled state separately from current `off`, `unknown`, `ready`, or `blocked` status.
+
 `codexAccountPriorities` is a persisted Pool *ordering* boundary and never an eligibility one. It maps
 an account id to an integer from -100 to 100, higher used earlier, with absence meaning 0. Selection
 narrows the already-eligible list to the highest tier that still holds an account with quota headroom
@@ -107,6 +245,29 @@ The pin is a ceiling, not a selection: inside the capped tier the strategy curso
 pinned account and the effective active account are different questions, and the management API answers
 both (`pinned` and `pinnedAccountId`). A surface that marks only the active account loses the pin from
 view exactly when it is doing the most work — suppressing every higher tier.
+
+A keyring-backed Codex request can carry its own forwardable ChatGPT bearer while the provider remains
+in Pool mode. When the effective manual pin is `__main__`, main is not paused, and its cached quota still
+has headroom, auth resolution validates the caller bearer's own gated-model roster and uses that
+request-owned credential before stored-Pool selection. The credential never enters Pool persistence,
+affinity, entitlement cache, or health state, and this decision never reads the physical main credential.
+If the caller lacks the requested model, a stored-account model detour may serve the request without
+clearing the healthy shared main pin. A paused or quota-drained main skips this exception and follows the
+ordinary Pool promotion path.
+
+[Decision Log]
+- 목적과 의도: Keep an explicit healthy main selection from being replaced by an exhausted stored
+  account merely because the client supplied main through a request-owned keyring bearer.
+- 기존 구현 및 제약 조건: Request-owned credentials are deliberately excluded from stored-account
+  entitlement discovery, but shared-state preservation interpreted that exclusion as a dead main login.
+- 검토한 주요 대안: Persist the caller credential, read the physical main token for identity, ignore
+  the manual pin, or validate the caller independently before stored-Pool selection.
+- 선택한 방식: Use only the effective pin, pause state, cached quota, and the caller credential's own
+  gated-model check; synthesize shared-state liveness only while main stays request-ineligible.
+- 다른 대안 대신 이 방식을 선택한 이유: It preserves credential isolation and explicit operator
+  intent without admitting an unentitled model or binding an ephemeral bearer into durable Pool state.
+- 장점, 단점 및 영향: Healthy main pins survive keyring requests and model-only detours; cached quota
+  remains the only proactive drain evidence available without crossing the physical credential boundary.
 
 ```text
 gpt-5.6-sol                         # openai; Pool or Direct follows the provider option

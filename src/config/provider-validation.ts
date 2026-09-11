@@ -1,6 +1,10 @@
 import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
 import { redactSecretString } from "../lib/redact";
-import { modelRecordValue } from "../reasoning-effort";
+import {
+  isValidModelDiscoveryModelId,
+  MODEL_DISCOVERY_MAX_MODELS,
+} from "../providers/model-discovery-limits";
+import { isDeclaredReasoningEffort, modelRecordValue } from "../reasoning-effort";
 import {
   isWirePinnedModel,
   MODEL_ADAPTER_OVERRIDE_ALLOWED,
@@ -20,6 +24,77 @@ const SENSITIVE_PROVIDER_HEADERS = new Set([
   "x-amz-security-token",
 ]);
 const REASONING_SUMMARY_DELIVERY_SET = new Set<string>(REASONING_SUMMARY_DELIVERY_VALUES);
+const DISPLAY_NAME_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const MAX_MODEL_DISPLAY_NAME_LENGTH = 128;
+
+/** Operator pins share one strict boundary across config and management writes. */
+export function pinnedReasoningEffortConfigError(value: unknown, allowClear = false): string | null {
+  if (value === undefined || (allowClear && (value === null || value === ""))) return null;
+  return typeof value === "string" && isDeclaredReasoningEffort(value)
+    ? null : "pinnedReasoningEffort must be a declared reasoning effort";
+}
+
+export function modelPinnedEffortsConfigError(
+  value: unknown,
+  field = "modelPinnedEfforts",
+  allowTombstones = false,
+): string | null {
+  if (value === undefined || (allowTombstones && value === null)) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    return `${field} must be a plain object`;
+  }
+  const keys = new Set<string>();
+  for (const [key, effort] of Object.entries(value)) {
+    const normalized = key.trim();
+    if (!normalized || ["__proto__", "prototype", "constructor"].includes(normalized)) {
+      return `${field} keys must be nonblank model ids and must not be reserved object keys`;
+    }
+    if (keys.has(normalized)) return `${field} keys must be unique after trimming`;
+    keys.add(normalized);
+    if (allowTombstones && (effort === null || effort === "")) continue;
+    if (typeof effort !== "string" || !isDeclaredReasoningEffort(effort)) {
+      return `${field} values must be declared reasoning efforts`;
+    }
+  }
+  return null;
+}
+
+/** Apply a validated map patch; null clears the field, entry tombstones remove one key. */
+export function mergeModelPinnedEfforts(
+  current: Record<string, string> | undefined,
+  patch: unknown,
+): Record<string, string> | undefined {
+  if (patch === undefined) return current === undefined ? undefined : { ...current };
+  if (patch === null) return undefined;
+  const next = Object.fromEntries(Object.entries(current ?? {}).map(([key, value]) => [key.trim(), value]));
+  for (const [key, effort] of Object.entries(patch as Record<string, string | null>)) {
+    if (effort === null || effort === "") delete next[key.trim()];
+    else next[key.trim()] = effort;
+  }
+  return Object.keys(next).length ? next : undefined;
+}
+
+export function providerReasoningPinsConfigError(provider: Record<string, unknown>): string | null {
+  return pinnedReasoningEffortConfigError(provider.pinnedReasoningEffort)
+    ?? modelPinnedEffortsConfigError(provider.modelPinnedReasoningEfforts, "modelPinnedReasoningEfforts");
+}
+
+/** Validate only pin fields, including callers that bypass the whole-config schema. */
+export function configReasoningPinsConfigError(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const globalError = modelPinnedEffortsConfigError(raw.modelPinnedEfforts);
+  if (globalError) return globalError;
+  if (raw.providers && typeof raw.providers === "object") {
+    for (const provider of Object.values(raw.providers)) {
+      if (!provider || typeof provider !== "object") continue;
+      const error = providerReasoningPinsConfigError(provider as Record<string, unknown>);
+      if (error) return error;
+    }
+  }
+  return null;
+}
 
 /** Validate a provider destination without coupling DTO callers to config persistence. */
 export function providerBaseUrlConfigError(baseUrl: string): string | null {
@@ -120,6 +195,40 @@ export function booleanRecordConfigError(value: unknown, field: string): string 
   for (const [key, entry] of Object.entries(value)) {
     if (!key.trim()) return `${field} keys must be nonblank model ids`;
     if (typeof entry !== "boolean") return `${field}.${key} must be a boolean`;
+  }
+  return null;
+}
+
+/** Validate display-only labels without changing the provider's model identity. */
+export function modelDisplayNamesConfigError(
+  value: unknown,
+  field = "modelDisplayNames",
+): string | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return `${field} must be a plain object`;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return `${field} must be a plain object with own properties`;
+  }
+  const entries = Object.entries(value);
+  // One discovered model can own one label, so both maps share the same safe cap.
+  if (entries.length > MODEL_DISCOVERY_MAX_MODELS) {
+    return `${field} must contain at most ${MODEL_DISCOVERY_MAX_MODELS} entries`;
+  }
+  for (const [modelId, displayName] of entries) {
+    if (!isValidModelDiscoveryModelId(modelId)) return `${field} keys must be valid model ids`;
+    const safeModelId = JSON.stringify(redactSecretString(modelId));
+    if (typeof displayName !== "string") return `${field}.${safeModelId} must be a string`;
+    const trimmed = displayName.trim();
+    if (!trimmed) return `${field}.${safeModelId} must be nonblank`;
+    if (displayName !== trimmed) return `${field}.${safeModelId} must be trimmed`;
+    if (displayName.length > MAX_MODEL_DISPLAY_NAME_LENGTH) {
+      return `${field}.${safeModelId} must be at most ${MAX_MODEL_DISPLAY_NAME_LENGTH} characters`;
+    }
+    if (displayName.includes("/")) return `${field}.${safeModelId} must not contain /`;
+    if (DISPLAY_NAME_CONTROL_CHARS.test(displayName)) {
+      return `${field}.${safeModelId} must not contain control characters`;
+    }
   }
   return null;
 }

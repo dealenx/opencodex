@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { atomicWriteFile, expandUserPath, getConfigDir, websocketsEnabled } from "../../config";
+import { atomicWriteFile, expandUserPath, getConfigDir, loadConfig, ultraFastTierEnabled, websocketsEnabled } from "../../config";
 import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readRootTomlString, resolveCodexConfigPath } from "../paths";
 import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCached, isModelsFetchCoolingDown, markModelsFetchFailure, setCached } from "../model-cache";
 import { buildModelsRequest, resolveModelsAuthToken } from "../../oauth";
@@ -31,10 +31,11 @@ import { redactSecretString } from "../../lib/redact";
 import upstreamModelsSnapshot from "../data/upstream-models.json";
 
 
-import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, isNativeOpenAiCapabilityAliasModel, nativeMultiAgentVersion, nativeOpenAiAutoCompactTokenLimit, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "./metadata";
+import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, hasNativeOpenAiCapabilityMetadata, nativeMultiAgentVersion, nativeOpenAiAutoCompactTokenLimit, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "./metadata";
 import { clampAutoCompactTokenLimit } from "../../providers/auto-compact-budget";
 import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
 import { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "./kinds";
+import { NATIVE_GPT6_ASTRA_MODEL } from "./native-models";
 
 export function legacyCatalogBackupPath(): string {
   return join(getConfigDir(), "catalog-backup.json");
@@ -95,6 +96,8 @@ export const CODEX_PROVIDER_MODEL_CATALOG_KIND = "provider-model-v1";
 export interface CatalogModel {
   id: string;
   provider: string;
+  /** Canonical or configured short alias for the provider segment. */
+  providerAlias?: string | null;
   /** Public Codex-facing slug override (used by combo aliases). */
   alias?: string;
   /** Explicit combo takeover of a bare OpenAI-native catalog id. */
@@ -112,6 +115,8 @@ export interface CatalogModel {
   defaultReasoningEffort?: string;
   contextWindow?: number;
   maxInputTokens?: number;
+  /** Model-scoped output-token ceiling; omitted when no authoritative value is known. */
+  maxOutputTokens?: number;
   /** Soft client compaction threshold; hard context/input limits remain authoritative. */
   autoCompactTokenLimit?: number;
   contextCap?: number;
@@ -139,6 +144,29 @@ export interface CatalogModel {
   codexToolMode?: "code_mode_only" | "shell";
   /** Normalized upstream capability names retained for management/API consumers (#485 follow-up). */
   capabilities?: string[];
+  /**
+   * This row is listed but cannot currently serve a request (#1711). Today the only value is
+   * "no_credit", set when every usable target has positive quota-exhaustion evidence.
+   *
+   * It is NOT visibility. The row stays `visibility: "list"` on purpose: the issue explicitly
+   * rejects hiding, and Codex Desktop only understands "list" and "hide" anyway, so hiding would
+   * be the one outcome the reporter asked not to have. An OpenCodex-aware consumer greys the
+   * entry; the native picker ignores the field, which is the honest limit of what a custom
+   * catalog field can do.
+   */
+  quotaInactiveReason?: "no_credit";
+  /**
+   * Discovered per-token cost class for this routed model (#3666). "free" means the provider's
+   * own /models row reported a numeric zero for BOTH the prompt and the completion rate;
+   * "paid" means at least one rate is above zero. ABSENT means unknown — the provider published
+   * no usable pair, or this row never came from a models API at all.
+   *
+   * Fail closed: a partial, non-numeric, or negative rate leaves the field absent, never "free",
+   * because showing a paid model under a Free filter costs the user money while hiding a free
+   * one costs a click. This is a management/Dashboard projection only — deriveEntry never
+   * serializes it into the Codex catalog, and it never affects routing or visibility.
+   */
+  pricingStatus?: "free" | "paid";
   /** OpenCodex-only catalog ownership marker; Codex ignores the serialized extension field. */
   catalogKind?: typeof CODEX_CUSTOM_MODEL_CATALOG_KIND | typeof CODEX_PROVIDER_MODEL_CATALOG_KIND;
 }
@@ -301,7 +329,98 @@ const NO_FAST_TIER_NATIVE_SLUGS = new Set([
   "gpt-5.3-codex-spark",
 ]);
 
+/** Does this row already carry an `ultrafast` tier the operator put there themselves? */
+/**
+ * Read the opt-in from the live config, ONCE per catalog build.
+ *
+ * `deriveEntry` and its call sites are pure `RawEntry -> RawEntry` transforms with no
+ * config parameter, so the flag is resolved here rather than threaded through all of them.
+ * It is memoized because `normalizeRoutedCatalogEntry` runs per entry in a sync loop, and
+ * `loadConfig()` chmods the config dir, hardens three secrets, reads the file and runs a
+ * full Zod parse — doing that once per catalog row would be a real cost for one boolean.
+ * Callers holding a config still pass `opts.ultraFastTier` explicitly, which bypasses this
+ * entirely and is what the tests do. A read failure means OFF, matching `.catch(false)`.
+ */
+let ultraFastOptInCache: { value: boolean; at: number } | null = null;
+const ULTRA_FAST_OPT_IN_TTL_MS = 5_000;
+
+function ultraFastTierOptIn(): boolean {
+  const now = Date.now();
+  if (ultraFastOptInCache && now - ultraFastOptInCache.at < ULTRA_FAST_OPT_IN_TTL_MS) {
+    return ultraFastOptInCache.value;
+  }
+  let value = false;
+  try {
+    value = ultraFastTierEnabled(loadConfig());
+  } catch {
+    value = false;
+  }
+  ultraFastOptInCache = { value, at: now };
+  return value;
+}
+
+/** Test seam: drop the memoized opt-in so a config change is observed immediately. */
+export function resetUltraFastTierOptInCache(): void {
+  ultraFastOptInCache = null;
+}
+
+function entryDeclaresUltraFast(entry: RawEntry): boolean {
+  const tiers = entry.service_tiers;
+  const declaredInTiers = Array.isArray(tiers) && tiers.some(tier => (
+    !!tier && typeof tier === "object" && "id" in tier
+    && String((tier as { id?: unknown }).id).trim().toLowerCase() === "ultrafast"
+  ));
+  const speeds = entry.additional_speed_tiers;
+  const declaredInSpeeds = Array.isArray(speeds) && speeds.some(speed => (
+    typeof speed === "string" && speed.trim().toLowerCase() === "ultrafast"
+  ));
+  return declaredInTiers || declaredInSpeeds;
+}
+
+/**
+ * Keep the operator's `ultrafast` and drop everything else.
+ *
+ * A routed row must not inherit the native template's `priority` tier, which is the whole
+ * reason this strip exists. Preserving the supplied tier without this narrowing would
+ * smuggle Fast onto third-party providers under an unrelated flag.
+ */
+function retainOnlyUltraFastTier(entry: RawEntry): void {
+  const tiers = entry.service_tiers;
+  const keptTiers = Array.isArray(tiers)
+    ? tiers.filter(tier => (
+      !!tier && typeof tier === "object" && "id" in tier
+      && String((tier as { id?: unknown }).id).trim().toLowerCase() === "ultrafast"
+    ))
+    : [];
+  if (keptTiers.length > 0) entry.service_tiers = keptTiers;
+  else delete entry.service_tiers;
+
+  const speeds = entry.additional_speed_tiers;
+  const keptSpeeds = Array.isArray(speeds)
+    ? speeds.filter(speed => typeof speed === "string" && speed.trim().toLowerCase() === "ultrafast")
+    : [];
+  if (keptSpeeds.length > 0) entry.additional_speed_tiers = keptSpeeds;
+  else delete entry.additional_speed_tiers;
+
+  // A default of `priority` on a row that now only offers ultrafast would name a tier the
+  // row no longer carries.
+  if (String(entry.service_tier ?? "").trim().toLowerCase() !== "ultrafast") delete entry.service_tier;
+  if (String(entry.default_service_tier ?? "").trim().toLowerCase() !== "ultrafast") {
+    delete entry.default_service_tier;
+  }
+}
+
 export function normalizeServiceTiers(entry: RawEntry): RawEntry {
+  // Repair only the old built-in Astra speed copy on persisted native/account rows.
+  // A custom description (and every other field) remains user-owned.
+  const nativeSlug = trustedAccountBoundNativeCatalogSlug(entry) ?? entry.slug;
+  if (nativeSlug === NATIVE_GPT6_ASTRA_MODEL && Array.isArray(entry.service_tiers)) {
+    entry.service_tiers = entry.service_tiers.map(tier =>
+      tier && typeof tier === "object" && tier.id === "priority"
+        && tier.description === "1.5x speed, increased usage"
+        ? { ...tier, description: "2x speed, increased usage" } : tier,
+    );
+  }
   // Strip service tiers for models that do not actually support the Fast tier.
   if (typeof entry.slug === "string" && NO_FAST_TIER_NATIVE_SLUGS.has(entry.slug)) {
     delete entry.service_tier;
@@ -500,6 +619,8 @@ export function ensureStrictCatalogFields(
 export type MultiAgentMode = "v1" | "default" | "v2";
 
 export interface MultiAgentModeOptions {
+  /** Caller-owned source metadata already defines the default for these projected rows. */
+  preserveDefaultMultiAgentVersion?: (entry: RawEntry) => boolean;
   /**
    * When the catalog is in v2 mode, stamp ChatGPT-native rows as v1 instead.
    * Routed parents get v2 (plaintext child tasks). Native Sol/Terra stay on v1
@@ -524,7 +645,7 @@ export function catalogEntryIsNativeChatGpt(entry: RawEntry): boolean {
   if (
     entry.opencodex_catalog_kind === CODEX_CUSTOM_MODEL_CATALOG_KIND
     && entry.use_responses_lite === true
-    && isNativeOpenAiCapabilityAliasModel(routedNativeSlug)
+    && hasNativeOpenAiCapabilityMetadata(routedNativeSlug)
   ) return true;
   if (UPSTREAM_NATIVE_ENTRIES.has(slug) || SUPPORTED_NATIVE_OPENAI_SLUGS.has(slug)) return true;
   return false;
@@ -575,6 +696,7 @@ export function applyMultiAgentMode(
     // Restore upstream defaults: clear any stale forced multi_agent_version and
     // re-apply upstream pins from the snapshot for native entries that have one.
     for (const entry of entries) {
+      if (options.preserveDefaultMultiAgentVersion?.(entry)) continue;
       const slug = typeof entry.slug === "string" ? entry.slug : "";
       const nativeAlias = entry.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND;
       const routedNativeSlug = slug.startsWith(`${OPENAI_CODEX_PROVIDER_ID}/`)
@@ -582,7 +704,7 @@ export function applyMultiAgentMode(
         : "";
       const codexForwardCapabilityAlias = entry.opencodex_catalog_kind === CODEX_CUSTOM_MODEL_CATALOG_KIND
         && entry.use_responses_lite === true
-        && isNativeOpenAiCapabilityAliasModel(routedNativeSlug)
+        && hasNativeOpenAiCapabilityMetadata(routedNativeSlug)
         ? routedNativeSlug
         : undefined;
       const upstreamPin = nativeAlias
@@ -610,17 +732,34 @@ export function normalizeRoutedCatalogEntry(
   entry: RawEntry,
   parallelToolCalls = false,
   toolMode?: "code_mode_only" | "shell" | string,
+  opts?: { ultraFastTier?: boolean },
 ): RawEntry {
   delete entry.model_messages;
   delete entry.tool_mode;
   applyRoutedCodexToolMode(entry, toolMode);
   delete entry.multi_agent_version;
+  delete entry.multi_agent_reasoning_effort;
   delete entry.use_responses_lite;
   delete entry.supports_websockets;
-  delete entry.additional_speed_tiers;
-  delete entry.service_tier;
-  delete entry.service_tiers;
-  delete entry.default_service_tier;
+  /*
+   * Tier metadata is stripped from routed rows because a row cloned from a native template
+   * would otherwise hand a third-party provider OpenAI's tiers.
+   *
+   * The opt-in carves out exactly one case: an `ultrafast` the OPERATOR put in their own
+   * catalog. #3429's reporter added it by hand and watched a regeneration delete it every
+   * time. Preserving what they wrote is not the same as advertising a tier — upstream
+   * publishes only `priority`, and synthesizing an ultrafast row is what PR #2994 was
+   * closed for. So this keeps a supplied tier and still never invents one.
+   */
+  const keepUltraFast = (opts?.ultraFastTier ?? ultraFastTierOptIn()) && entryDeclaresUltraFast(entry);
+  if (!keepUltraFast) {
+    delete entry.additional_speed_tiers;
+    delete entry.service_tier;
+    delete entry.service_tiers;
+    delete entry.default_service_tier;
+  } else {
+    retainOnlyUltraFastTier(entry);
+  }
   // Routed rows cloned from native templates must not inherit OpenAI-only summary delivery.
   // Explicit provider/model metadata is re-applied after this normalization step.
   delete entry.supports_reasoning_summaries;

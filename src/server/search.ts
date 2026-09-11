@@ -19,6 +19,9 @@ import {
   CodexThreadAffinityExpiredError,
 } from "../codex/auth-context";
 import { codexAccountNamespaceForModel } from "../codex/account-namespace-match";
+import { NATIVE_RESERVE_MODEL } from "../codex/catalog/native-models";
+import { isCodexReserveRequestEligible } from "../codex/loopback-target";
+import type { DataPlaneAdmission } from "./auth-cors";
 import { formatCodexProviderForLog } from "../codex/routing";
 import { signalWithTimeout } from "../lib/abort";
 import { readBoundedResponseBytes } from "../lib/bounded-body";
@@ -30,7 +33,7 @@ import {
   type ExactOpenAiSidecarAccount,
 } from "../providers/openai-sidecar";
 import { routeModel } from "../router";
-import { readJsonRequestBody } from "./request-decompress";
+import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
 import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } from "./auth-cors";
 import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId, decodeRequestErrorResponse } from "./responses";
@@ -52,6 +55,7 @@ export async function handleSearch(
   config: OcxConfig,
   logCtx: RequestLogContext,
   turnAdmissionLease?: AdmissionLease,
+  admission?: DataPlaneAdmission,
 ): Promise<Response> {
   try { validateForwardAdmissionCredential(req.headers, config); }
   catch (err) {
@@ -60,7 +64,7 @@ export async function handleSearch(
   }
   let body: unknown;
   try {
-    body = await readJsonRequestBody(req);
+    body = await readJsonRequestBody(req, undefined, resolveInboundBodyLimitBytes(config.maxInboundBodyBytes));
   } catch (err) {
     return decodeRequestErrorResponse(err, "search");
   }
@@ -93,6 +97,10 @@ export async function handleSearch(
     }
   }
 
+  if (isCodexReserveRequestEligible(config, admission) && (exactAccount?.modelId ?? model) === NATIVE_RESERVE_MODEL) {
+    return formatErrorResponse(400, "invalid_request_error",
+      "Luna Reserve compatibility is only available as a conversation model, not the standalone search relay. Choose another search model.");
+  }
   const candidates = listOpenAiForwardSidecarCandidates(config);
   if (candidates.length === 0) {
     return formatErrorResponse(
@@ -107,6 +115,7 @@ export async function handleSearch(
   try {
     upstream = await resolveFirstUsableOpenAiSidecar(candidates, req.headers, config, {
       exactAccount,
+      admission,
       beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
     });
     if (!upstream) {

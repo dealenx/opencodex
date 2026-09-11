@@ -2,6 +2,9 @@ import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 import { modelInList, toolChoiceToolPredicate } from "../types";
 import { isModelTextOnly } from "../vision";
 import type { SidecarSettings } from "./executor";
+import type { CodexAuthPolicyConfig } from "../codex/auth-context";
+import { isCodexReserveRequestEligible } from "../codex/loopback-target";
+import type { DataPlaneAdmission } from "../server/auth-cors";
 import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
 import { resolveSidecarAuth } from "../sidecar/auth";
 import { getAccountSet } from "../oauth/store";
@@ -23,7 +26,7 @@ const DEFAULT_ANTHROPIC_SIDECAR_MODEL = "claude-sonnet-5";
 // Default Grok model for the xai-backed sidecar (probe-verified with hosted tools, devlog 003).
 const DEFAULT_XAI_SIDECAR_MODEL = "grok-4.6";
 // Default Gemini model for the gemini-backed sidecar (CCA grounding probe, devlog 002).
-const DEFAULT_GEMINI_SIDECAR_MODEL = "gemini-3.7-flash";
+const DEFAULT_GEMINI_SIDECAR_MODEL = "gemini-3.8-flash";
 // "low" is the lightest effort the ChatGPT backend allows with web_search ("minimal" is rejected:
 // "tools cannot be used with reasoning.effort 'minimal'") — keeps the sidecar fast/cheap.
 const DEFAULT_SIDECAR_REASONING = "low";
@@ -215,6 +218,7 @@ export function planWebSearch(
   provider: OcxProviderConfig,
   modelId: string,
   openAiSidecar?: ResolvedOpenAiForwardSidecar,
+  options: { admission?: Pick<DataPlaneAdmission, "source">; codexAuthPolicy?: CodexAuthPolicyConfig } = {},
 ): SidecarPlan | undefined {
   if (!parsed._webSearch || isPassthrough) return undefined;
   if (!toolChoiceToolPredicate(parsed.options.toolChoice)(buildWebSearchTool())) return undefined;
@@ -322,7 +326,10 @@ export function planWebSearch(
     backend: "openai",
     forwardSidecar: openAiSidecar,
     hostedTool: parsed._webSearch,
-    settings: { model: cfg.model ?? DEFAULT_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
+    settings: {
+      model: cfg.model ?? DEFAULT_SIDECAR_MODEL, reasoning, timeoutMs, describeImages,
+      ...(isCodexReserveRequestEligible(options.codexAuthPolicy ?? config, options.admission) ? { reserveCompatibility: true } : {}),
+    },
     maxSearches,
     routedModelStallTimeoutMs,
     stallTimeoutSec,

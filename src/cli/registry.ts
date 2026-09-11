@@ -36,8 +36,8 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   {
     name: "recover-history",
-    usage: "ocx recover-history --legacy-openai --yes",
-    summary: "Force all user-message opencodex rows to OpenAI for legacy recovery.",
+    usage: "ocx recover-history (--legacy-openai | --ocx-compaction <thread-id>) --yes",
+    summary: "Recover legacy provider metadata or one OpenCodeX-compacted thread for native replay.",
   },
   {
     name: "uninstall",
@@ -87,6 +87,24 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   { name: "ensure", usage: "ocx ensure", summary: "Ensure the proxy is running and Codex config/cache are current." },
   {
+    name: "connect",
+    usage: "ocx connect <url> [--management-url <url>] (--pairing-code-stdin | --admin-token-stdin) [--clients codex,claude] [--management-transport direct|relay] [--catalog-timeout <seconds>] [--no-sync]",
+    summary: "Connect this machine to a remote OpenCodex hub without persisting the one-time authority.",
+    details: [
+      "Status: ocx connect status [--json]",
+      "Rotate or recover: ocx connect rotate (--pairing-code-stdin | --admin-token-stdin) [--json]",
+      "Revoke while connected: ocx connect revoke --admin-token-stdin [--json]",
+      "Machine resources: /api/machine/status, /api/machine/shim, /api/machine/clients, /api/machine/sync, /api/machine/disconnect, and the fixed /api/machine/hub-relay namespace.",
+      "Remote browser self-logout uses /api/session/logout from the GUI; it is distinct from client disconnect and key revocation.",
+      "Credentials are accepted only through stdin; argv and environment credential forms are not supported.",
+    ],
+  },
+  {
+    name: "disconnect",
+    usage: "ocx disconnect [--keep-catalog] [--json]",
+    summary: "Restore local client state offline and clear the remote-hub connection.",
+  },
+  {
     name: "sync",
     usage: "ocx sync [--restart-codex] [--restart-desktop-app]",
     summary: "Fetch provider models and inject them into Codex config.",
@@ -128,7 +146,15 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   { name: "login", usage: "ocx login <provider>", summary: "OAuth or API-key login for a provider." },
   { name: "logout", usage: "ocx logout <provider>", summary: "Remove a stored provider login." },
-  { name: "gui", usage: "ocx gui", summary: "Open the opencodex dashboard." },
+  {
+    name: "gui",
+    usage: "ocx gui [pair --origin <browser-origin> [--json]]",
+    summary: "Open the opencodex dashboard or create a secret single-use remote pairing grant.",
+    details: [
+      "Pairing requires an explicit allowed --origin; there is no localhost or config-derived default.",
+      "The printed grant is secret, single-use, short-lived, and must not be persisted.",
+    ],
+  },
   {
     name: "update",
     usage: "ocx update [--tag latest|preview]",
@@ -203,6 +229,19 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     summary: "Manage routing features; combo is currently the supported routing resource.",
   },
   {
+    name: "effort",
+    usage: "ocx effort [status|<level>|set|clear|model] [--main <level|->] [--subagent <level|->] [--injection <level|->] [--json]",
+    summary: "Inspect and configure reasoning effort caps and defaults.",
+    details: [
+      "With no arguments or `status`, displays effective effort caps, injection effort, and supported rungs.",
+      "`ocx effort <level>` (or `set --main <level>`) sets the global/main-agent reasoning ceiling.",
+      "`--subagent <level>` sets the hard ceiling for delegated sub-agent turns.",
+      "`ocx effort clear` (or `set --main - --subagent -`) removes main and subagent caps but preserves injection effort; use `ocx effort set --injection -` to clear it.",
+      "`ocx effort model <provider/model|model>` inspects a model's configured ladder, disabled status, and wire mappings.",
+      "Works both online (via live proxy API) and offline (modifies persisted config safely with atomic writes).",
+    ],
+  },
+  {
     name: "agent",
     usage: "ocx agent <status|injection|effort|subagents|fallback|sidecar> ...",
     summary: "Manage headless multi-agent, roster, effort, injection, and sidecar settings.",
@@ -240,12 +279,16 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     name: "access",
     usage: "ocx access <key|endpoints|models|test> ...",
     summary: "Manage OpenCodex admission API keys and inspect external endpoints.",
+    details: [
+      "Key rotation start uses POST /api/keys/rotate and returns the replacement secret once.",
+      "Commit uses POST /api/keys/rotate/commit; abort uses DELETE /api/keys/rotate with the returned rotation id.",
+    ],
   },
-  { name: "api-key", usage: "ocx api-key <list|create|remove> ...", summary: "Alias of ocx access key." },
+  { name: "api-key", usage: "ocx api-key <list|create|rotate|remove> ...", summary: "Alias of ocx access key." },
   {
     name: "export",
-    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside> [--json] [--out <path>] [--force]",
-    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside) wired to the running proxy.",
+    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast> [--json] [--out <path>] [--force]",
+    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside, Raycast) wired to the running proxy.",
     details: [
       "--json prints the generated document as JSON on stdout; use --out for the client's native format.",
       "--out <path> writes the native config there and refuses to replace an existing file without --force.",
@@ -285,13 +328,14 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   {
     name: "claude",
     usage: "ocx claude [claude args...]",
-    summary: "Launch Claude Code wired to the proxy (env injection + gateway model discovery).",
+    summary: "Launch Claude Code through the proxy, with native fallback when Claude routing is disabled.",
     details: [
       "Ensures the proxy is running, then execs `claude` with ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN,",
       "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 and model slots from config.claudeCode.",
+      "When Claude routing is explicitly disabled, it launches natively after removing proven OpenCodex-owned proxy state.",
       "Routed models appear in the native /model picker with stable claude-opus-4-8-2026MMDD slot aliases (Claude Code >= 2.1.129).",
       "Older versions: pick models via ANTHROPIC_MODEL or /model <id> directly (any string passes through).",
-      "User-exported ANTHROPIC_* variables always take precedence.",
+      "User-exported ANTHROPIC_* variables take precedence for routed launches; native fallback removes only proven OpenCodex-owned proxy values.",
       "",
       "Claude Desktop profile:",
       "  ocx claude desktop [apply]                         Save and apply the four-family profile",

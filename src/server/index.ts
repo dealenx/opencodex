@@ -13,7 +13,6 @@ import {
 } from "./ws-bridge";
 import type { Server, ServerWebSocket } from "bun";
 import {
-  DEFAULT_SUBAGENT_MODELS,
   applyProxyEnv,
   armClaudeCodeBaseline,
   loadConfig,
@@ -22,6 +21,9 @@ import {
   websocketsEnabled,
 } from "../config";
 import { grokDefaultReasoningEffort } from "../grok/effort";
+import { flushConfigDirHardening } from "../config/paths";
+import { migrateStartupSubagentModels } from "./subagent-models-startup";
+import { migrateStartupXaiResponses } from "./xai-responses-startup";
 import { reconcileOAuthProviders } from "../oauth";
 import { withCatalogWriteSerialization } from "../codex/catalog-write-serialization";
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
@@ -33,7 +35,12 @@ import {
   type NativeCodexOwnership,
   type OwnershipInspection,
 } from "../integrations/native/ownership-preflight";
-import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
+import {
+  createResetCreditWhamClient,
+  registerCodexCooldownRecoveryProbeWorker,
+} from "../codex/auth-api";
+import { activateResetCreditAutoRedeem } from "../codex/reset-credit-auto-redeem";
+import { registerCodexQuotaAutoRefreshWorker } from "../codex/quota-auto-refresh";
 import {
   reconcileLiveStateStores,
   setLiveStateStoreConfig,
@@ -57,7 +64,11 @@ import { runModelRenameStartupMigration } from "../providers/model-rename-startu
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { StorageCleanupPolicy } from "../types";
-import { MAX_DECOMPRESSED_BODY_BYTES } from "./request-decompress";
+import {
+  MAX_CONFIGURABLE_INBOUND_BODY_BYTES,
+  MIN_CONFIGURABLE_INBOUND_BODY_BYTES,
+  resolveInboundBodyLimitBytes,
+} from "./request-decompress";
 import {
   CodexAccountCooldownError,
   cooldownErrorMessage,
@@ -157,6 +168,7 @@ import {
   resolveApiAuth,
   resolveResponsesApiAuth,
   requestPolicyView,
+  type DataPlaneAdmission,
   type RequestPolicyView,
   safeConfigDTO,
   setCorsOrigin,
@@ -177,7 +189,8 @@ export { disableResponsesRequestTimeout, linkAbortSignal } from "./responses";
 import { handleClaudeCountTokens, handleClaudeMessages } from "./claude-messages";
 import { handleChatCompletions } from "./chat-completions";
 import { anthropicErrorResponse } from "../claude/outbound";
-import { buildDesktop3pRegistry } from "../claude/desktop-3p";
+import { buildDesktop3pRegistry, generateDesktop3pModels } from "../claude/desktop-3p";
+import { buildDesktopDiscoveryInputs } from "../claude/desktop-discovery-inputs";
 import { runClaudeAuthModeMigration } from "../claude/auth-mode-migration";
 import {
   bindNativeMainStartupLifecycle,
@@ -192,6 +205,7 @@ import { handleLive, logLiveSidebandFrame, parseLiveSidebandTarget, resolveLiveS
 import { handleSearch } from "./search";
 import { fetchAllModels, handleManagementAPI, VERSION, type ManagementApiDeps } from "./management-api";
 import {
+  createManagementSessionControl,
   initializeManagementAuthState,
   issueGuiSession,
   managementPrincipal,
@@ -206,15 +220,100 @@ import {
 } from "../lib/local-management-attestation";
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../lib/system-restart-contract";
 import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../lib/local-provider-reload-contract";
+import {
+  GUI_PAIR_BROWSER_ORIGIN_HEADER,
+  GUI_PAIR_CAPABILITY_VERSION,
+  GUI_PAIR_PATH,
+} from "../lib/gui-pair-capability";
+import {
+  GuiPairingGrantRateLimitError,
+  consumeGuiPairingGrant,
+  createGuiPairingGrant,
+} from "./gui-session";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
 import {
   createRuntimePackageTreeIntegrityGuard,
   type PackageTreeIntegrityGuard,
 } from "../lib/package-tree-integrity";
 import { detectInstall } from "../update/index";
+import { readyProtocolMetadata } from "../remote/protocol";
+import { modelCapabilityFields } from "./models-capabilities";
+import { recordCursorSeen } from "../integrations/cursor-seen";
+import { detectCursorInstalls } from "../integrations/cursor-detect";
+import { loadCursorEffortTable } from "../integrations/cursor-effort-table";
+import { expandCursorEffortRow, knownEffortRowIds } from "./effort-row";
+import { catalogFastRowEligible, expandFastRow } from "./fast-row";
 
 export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
+
+// Header-safe by construction: a key id reaches a response header, so anything outside this
+// class could inject a header break or a control character into a response we control.
+const REMOTE_CATALOG_KEY_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+const GUI_PAIRING_EXCHANGE_BODY_LIMIT = 4 * 1024;
+
+/**
+ * Read at most `limit` bytes of a request body, or refuse.
+ *
+ * Returns null the moment the body is known to exceed `limit`, without retaining the excess.
+ * `req.text()` cannot express that: it buffers to completion first, so a caller who omits
+ * Content-Length or uses chunked framing decides how much memory the process spends. That
+ * matters here because the one caller is an unauthenticated endpoint.
+ *
+ * limit+1 is the stopping point rather than limit, so a body exactly at the limit is still
+ * accepted and only a genuinely over-limit body is rejected.
+ */
+async function readBoundedRequestText(req: Request, limit: number): Promise<string | null> {
+  const body = req.body;
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > limit) return null;
+      chunks.push(value);
+    }
+  } finally {
+    // Cancel rather than only releasing the lock: on the reject path the peer may still be
+    // sending, and an uncancelled body keeps that transfer alive.
+    await reader.cancel().catch(() => {});
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+/**
+ * Name WHICH configured credential was admitted, so a multi-key operator can attribute a
+ * catalog read.
+ *
+ * Scoped to configured keys on purpose: an environment token or a loopback bind has no key
+ * to name, and emitting one anyway would invent an attribution that does not exist. 200 only
+ * — this route emits no validator and therefore never answers 304.
+ *
+ * An id that fails the header-safe pattern is omitted rather than sanitized, with one warning
+ * that does NOT repeat the id: logging the offending value is how a malformed id becomes a
+ * log-injection vector instead of a dropped header.
+ */
+function withRemoteCatalogKeyId(response: Response, admission: DataPlaneAdmission): Response {
+  if (response.status !== 200 || admission.kind !== "configured") return response;
+  if (!REMOTE_CATALOG_KEY_ID_PATTERN.test(admission.keyId)) {
+    console.warn("[remote-catalog] configured API key id is not header-safe; omitting x-opencodex-key-id");
+    return response;
+  }
+  response.headers.set("x-opencodex-key-id", admission.keyId);
+  return response;
+}
+
 const LIVE_SIDEBAND_PENDING_MAX = 32;
 const LIVE_SIDEBAND_PENDING_BYTES_MAX = 1024 * 1024;
 const LIVE_SIDEBAND_CLOSE_FALLBACK_MS = 1_000;
@@ -423,7 +522,7 @@ function attachLiveSidebandUpstream(
 
 // Adapter resolution + wire-protocol override extracted to ./server/adapter-resolve.
 
-// Source invariant for tests/passthrough-abort.test.ts after the pure module split:
+// Source invariant for tests/responses/passthrough-abort.test.ts after the pure module split:
 // if (isEventStream && upstreamResponse.body) {
 // const repairConfig = route.provider.responsesItemIdRepair;
 // const needsClientRewrite = imageGenCallAliases.size > 0
@@ -497,6 +596,8 @@ export interface StartServerDeps {
   readinessGate?: ReadinessGate;
   /** Test-only package-tree observation; production captures package.json identity at boot. */
   packageTreeIntegrity?: PackageTreeIntegrityGuard;
+  /** Test-only seam for observing quota-worker registration ownership. */
+  registerCodexQuotaAutoRefreshWorker?: typeof registerCodexQuotaAutoRefreshWorker;
 }
 
 function inspectStartupOwnership(
@@ -567,25 +668,26 @@ export function isLoopbackBindInsideContainer(bindHost: string, dockerEnvPath = 
 
 export function startServer(port?: number, deps: StartServerDeps = {}): Server<WsData> {
   const localAttestationSecret = deps.localAttestationSecret ?? createLocalAttestationSecret();
-  const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(runOpenAiTierStartupMigration(loadConfig())));
+  // Captured before loadConfig() starts the optional ACL flight so stop() drains the same dir
+  // even if OPENCODEX_HOME changes underneath a long-lived process.
+  const startupConfigDir = getConfigDir();
+  const startupConfig = migrateStartupSubagentModels(
+    runModelRenameStartupMigration(runAlibabaRegionStartupMigration(runOpenAiTierStartupMigration(loadConfig()))),
+  );
+  // Reconcile disk-backed presets first: it replaces provider rows and must not undo
+  // an in-memory wire upgrade when that upgrade's persistence is temporarily unavailable.
+  reconcileOAuthProviders(startupConfig);
+  const config = migrateStartupXaiResponses(startupConfig);
   warnAgentTaskRecoveryStartup(config);
   setLiveStateStoreConfig(config);
   applyProxyEnv(config);
   assertServerAuthConfig(config);
   const managementAuth = deps.managementAuthState ?? initializeManagementAuthState(config);
+  const managementSessionControl = createManagementSessionControl(managementAuth);
   let userCostOverlayReconciler: { stop(): void } | null = null;
   // Arm synchronously before listen. A pending journal therefore makes __main__ unusable
   // before any request can resolve its physical credential, while health/management/Pool stay live.
-  // Refresh OAuth provider presets (models/noReasoningModels) from the registry so a proxy update
-  // adding/dropping models reaches existing configs on start — not just fresh installs.
-  reconcileOAuthProviders(config);
   reconcileLiveStateStores();
-  // Seed default featured subagent models on first run only (UNSET → defaults). A user-set list,
-  // even [], is left alone so GUI removals persist.
-  if (config.subagentModels === undefined) {
-    config.subagentModels = [...DEFAULT_SUBAGENT_MODELS];
-    saveConfig(config);
-  }
   // authMode migration (devlog 260726_claude_auth_auto/015): before "auto" existed,
   // choosing Subscription DELETED the key, so a pre-upgrade block with no authMode is
   // indistinguishable from "never chose". Pin those to subscription once so an upgrade
@@ -686,6 +788,10 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // Unauthenticated loopback listener (#1102). Off unless explicitly enabled.
   const loopbackListener = config.unauthenticatedLoopbackListener;
   const loopbackListenerPort = loopbackListener?.enabled ? loopbackListener.port : null;
+  // Hub management ingress is a third, management-only listener. Its address is intentionally
+  // fixed: the kernel loopback bind is the trust boundary that permits Tailscale identity headers.
+  const managementIngress = config.runtimeRole === "hub" ? config.hub?.managementIngress : undefined;
+  const managementIngressPort = managementIngress?.enabled ? managementIngress.port : null;
 
   /**
    * Which listener a request arrived on, expressed as the only thing that differs: the bind
@@ -707,8 +813,17 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
    * Routes the unauthenticated loopback listener will serve. Everything else 404s.
    *
    * This is an allowlist rather than a filter applied to the public handler, because a filter
-   * inverts the failure mode: a route added later would be reachable here by default. The four
-   * entries are exactly what a directly-spawned `codex app-server` needs.
+   * inverts the failure mode: a route added later would be reachable here by default. The
+   * entries below are exactly what a directly-spawned `codex app-server` needs.
+   *
+   * `POST /v1/alpha/search` is the native Codex web-search relay. Codex issues it against the
+   * same base URL as `/v1/responses`, so leaving it off the list turned every native web search
+   * on the direct-spawn host into a 404 (#3192). The handler still runs its own admission, so a
+   * loopback caller without a ChatGPT credential is refused inside it rather than by this gate.
+   *
+   * The standalone Images client uses the same base URL for its two POST routes. Their handler
+   * keeps the paid upstream behind its own admission and forward-credential checks, so admit only
+   * the exact methods and paths it serves (#3428).
    *
    * `GET /v1/models` is on the list for a reason that is easy to miss. When catalog
    * materialization fails or finds no source, `syncCodex` warns and injects with
@@ -722,15 +837,54 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       return req.method === "POST" || req.headers.get("upgrade")?.toLowerCase() === "websocket";
     }
     if (path === "/v1/responses/compact") return req.method === "POST";
-    if (path === "/v1/models") return req.method === "GET";
-    // Standalone realtime voice sessions (codex-rs thread/realtime/start, WebSocket
-    // transport) — a directly-spawned `codex app-server` needs these for desktop
-    // voice the same way it needs /v1/responses. WebSocket upgrades only; plain
-    // HTTP on these paths stays rejected.
-    if (path === "/v1/realtime" || path === "/v1/live") {
-      return req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    if (path === "/v1/alpha/search") return req.method === "POST";
+    if (path === "/v1/images/generations" || path === "/v1/images/edits") {
+      return req.method === "POST";
     }
+    if (path === "/v1/models") return req.method === "GET";
+    // Realtime voice — a directly-spawned `codex app-server` needs these for desktop voice
+    // the same way it needs /v1/responses. Two shapes, same trust model as /v1/responses:
+    //  - standalone sessions (codex-rs thread/realtime/start, WebSocket transport):
+    //    WebSocket upgrades on the bare /v1/realtime and /v1/live paths only;
+    //  - WebRTC calls (desktop v3 voice): POST call-create on /v1/live or
+    //    /v1/realtime/calls, then the sideband join as a WebSocket upgrade on the keyed
+    //    /v1/live/{callId}, /v1/realtime/calls/{callId}, or /v1/realtime?call_id= form
+    //    (the join reaches this listener through the injected
+    //    experimental_realtime_ws_base_url; openai/codex #35830).
+    // Plain HTTP on the upgrade paths stays rejected.
+    const isWebSocketUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    if (path === "/v1/realtime") return isWebSocketUpgrade;
+    if (path === "/v1/live") return isWebSocketUpgrade || req.method === "POST";
+    if (path === "/v1/realtime/calls") return req.method === "POST";
+    if (/^\/v1\/(?:live|realtime\/calls)\/[^/]+\/?$/.test(path)) return isWebSocketUpgrade;
     return false;
+  }
+
+  /**
+   * Routes the loopback hub-management listener will serve. This is default-deny so adding a
+   * data-plane or health route to the public handler cannot silently expose it through Tailscale
+   * Serve. A dotted GUI path is admitted only when it resolves to a packaged file; extensionless
+   * GETs intentionally retain the existing SPA fallback.
+   */
+  function managementIngressRouteAllowed(url: URL, req: Request): boolean {
+    const rawPath = url.pathname;
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") return false;
+    if (rawPath === "/opencodex-session") return req.method === "GET" || req.method === "POST";
+    if (rawPath.startsWith("/api/")) return true;
+    if (req.method !== "GET" && req.method !== "HEAD") return false;
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(rawPath);
+    } catch {
+      return false;
+    }
+    if (
+      decodedPath.startsWith("/v1/")
+      || decodedPath === "/healthz"
+      || decodedPath === "/readyz"
+    ) return false;
+    if (decodedPath === "/" || !decodedPath.includes(".")) return true;
+    return serveGuiFile(rawPath) !== null;
   }
 
   // Codex treats empty / non-JSON 503 bodies as "Unknown error" (#452). Keep Retry-After and
@@ -884,9 +1038,36 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     };
   let server: Server<WsData>;
   let loopbackServer: Server<WsData> | null = null;
+  let managementIngressServer: Server<WsData> | null = null;
+
+  // Resolved once, before any listener binds. The clamp is silent inside the resolver so it
+  // stays pure and per-request cheap; the operator is told here instead, once, because a
+  // config value that was quietly reduced is exactly the thing they would otherwise debug
+  // against the wrong limit.
+  const inboundBodyLimitBytes = resolveInboundBodyLimitBytes(config.maxInboundBodyBytes);
+  const requestedInboundBodyLimit = config.maxInboundBodyBytes;
+  if (requestedInboundBodyLimit !== undefined
+    && requestedInboundBodyLimit > 0
+    && requestedInboundBodyLimit !== inboundBodyLimitBytes) {
+    console.warn(
+      `[server] maxInboundBodyBytes=${requestedInboundBodyLimit} is outside the supported range `
+      + `[${MIN_CONFIGURABLE_INBOUND_BODY_BYTES}, ${MAX_CONFIGURABLE_INBOUND_BODY_BYTES}]; `
+      + `using ${inboundBodyLimitBytes} bytes.`,
+    );
+  }
+
+  type ServerIngress = "public" | "unauthenticated-loopback" | "hub-management";
+  function ingressForServer(requestServer: Server<WsData>): ServerIngress {
+    if (requestServer === loopbackServer) return "unauthenticated-loopback";
+    if (requestServer === managementIngressServer) return "hub-management";
+    return "public";
+  }
   let backgroundLifecycle: ReturnType<typeof acquireServerBackgroundLifecycle> | null = null;
+  let unregisterQuotaAutoRefresh: (() => void) | null = null;
   try {
     backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
+    unregisterQuotaAutoRefresh = (deps.registerCodexQuotaAutoRefreshWorker
+      ?? registerCodexQuotaAutoRefreshWorker)(config);
     // External `ocx config set` / direct config.json edits run in other
     // processes; poll the file so Logs/Usage display prices follow them live.
     // Started inside the guarded startup transaction so the catch below can
@@ -894,16 +1075,29 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = {
       idleTimeout: 255,
-      maxRequestBodySize: MAX_DECOMPRESSED_BODY_BYTES,
+      // Bun rejects an oversized body before `fetch` runs, so the listener has to be raised
+      // with the admission limit or the opt-in would do nothing. Fixed at bind time: a live
+      // `maxInboundBodyBytes` edit needs a restart, which the config doc states.
+      maxRequestBodySize: inboundBodyLimitBytes,
       async fetch(req: Request, requestServer: Server<WsData>): Promise<Response> {
+      const ingress = ingressForServer(requestServer);
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
       // silently when a route is added below.
-      if (requestServer === loopbackServer && !loopbackRouteAllowed(new URL(req.url), req)) {
+      if (ingress === "unauthenticated-loopback" && !loopbackRouteAllowed(new URL(req.url), req)) {
         return withCors(
           formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${new URL(req.url).pathname}`),
           req,
           loopbackPolicy(),
+        );
+      }
+      // Tailscale Serve terminates only on this separately bound loopback socket. Reject before
+      // dispatch so no data, readiness, health, WebSocket, or unknown-static handler can run.
+      if (ingress === "hub-management" && !managementIngressRouteAllowed(new URL(req.url), req)) {
+        return withCors(
+          formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${new URL(req.url).pathname}`),
+          req,
+          config,
         );
       }
       // Auth and CORS decisions below read `policy`, not `config`. For the public listener the
@@ -911,7 +1105,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       // view substitutes 127.0.0.1 as the bind address, which is what routes it through the
       // same code path a plain loopback bind has always taken — Host-header check included.
       // Routing, provider selection and response bodies keep using `config`.
-      const policy: RequestPolicyView = requestServer === loopbackServer ? loopbackPolicy() : config;
+      const policy: RequestPolicyView = ingress === "unauthenticated-loopback" ? loopbackPolicy() : config;
       const url = new URL(req.url);
       markActivity(`${req.method} ${url.pathname}`);
 
@@ -1021,6 +1215,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           port: healthPort,
           restartCapability: SYSTEM_RESTART_CAPABILITY_VERSION,
           providerReloadCapability: LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION,
+          guiPairCapability: GUI_PAIR_CAPABILITY_VERSION,
         }, 200, req, policy);
         const challenge = req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER);
         if (challenge) {
@@ -1054,6 +1249,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           pid: process.pid,
           port: boundPort ?? listenPort,
           status,
+          ...readyProtocolMetadata(config, req),
         };
         if (status === "ready") {
           return jsonResponse(body, 200, req, policy);
@@ -1078,7 +1274,29 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // gate used. Consent-bearing routes need this: request headers are forgeable
         // by anything holding the admin token, the credential is not.
         const principal = managementPrincipal(req, managementAuth, config, localManagementAuth) ?? undefined;
-        const mgmtResponse = await handleManagementAPI(req, url, config, deps.managementApi, principal);
+        if (url.pathname === GUI_PAIR_PATH) {
+          if (req.method !== "POST" || principal !== "gui-pair-capability" || !managementAuth.available) {
+            return withManagementCors(Response.json({ error: "GUI pairing capability required" }, { status: 403 }), req, config);
+          }
+          try {
+            const grant = createGuiPairingGrant(
+              req.headers.get(GUI_PAIR_BROWSER_ORIGIN_HEADER) ?? "",
+              config,
+              managementAuth,
+            );
+            return withManagementCors(Response.json(grant, {
+              status: 201,
+              headers: { "Cache-Control": "no-store" },
+            }), req, config);
+          } catch (error) {
+            const status = error instanceof GuiPairingGrantRateLimitError ? 429 : 403;
+            return withManagementCors(Response.json({ error: "GUI pairing grant refused" }, {
+              status,
+              ...(status === 429 ? { headers: { "Retry-After": "60" } } : {}),
+            }), req, config);
+          }
+        }
+        const mgmtResponse = await handleManagementAPI(req, url, config, deps.managementApi, principal, managementSessionControl);
         if (mgmtResponse) return withManagementCors(mgmtResponse, req, config);
         return withManagementCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, config);
       }
@@ -1104,7 +1322,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           // Built directly rather than through formatErrorResponse: that helper derives
           // `code` from the status and message via classifyError, and these two need stable,
           // specific codes. `catalog_not_found` in particular is what lets a caller — and
-          // tests/api-key-attribution.test.ts — tell "this route exists and has no catalog"
+          // tests/server/api-key-attribution.test.ts — tell "this route exists and has no catalog"
           // apart from "this route is gone", which is the difference between admission proof
           // and a vacuous pass.
           return withCors(
@@ -1134,23 +1352,34 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         }
         const headers: Record<string, string> = {
           "content-type": "application/json",
-          // Identity-varying content behind a credential: never let a shared cache keep it.
-          "cache-control": "private, no-cache",
+          // Identity-varying content behind a credential: never let a shared cache keep it,
+          // and never hand out a validator it could revalidate with. `no-cache` alone does
+          // not prevent storage — it forces revalidation, and the revalidation is exactly
+          // what would cross identities here, because this body varies by key type and key
+          // id while the ETag would be derived from bytes alone. A store keyed on URL plus
+          // validator could then serve one credential's representation to another. Proving
+          // an identity-partitioned cache key across every intermediary in the path is a
+          // much larger commitment than the bandwidth a 304 saves on this payload, so this
+          // route declines the trade: no-store, no ETag, no 304.
+          //
+          // GET /api/catalog keeps its validator. That route is management-authenticated
+          // and loopback-scoped, and its representation does not vary by data-key identity.
+          "cache-control": "no-store",
         };
-        if (serialized.etag) headers.ETag = serialized.etag;
         const version = await persistedCodexVersion();
         if (version) headers["x-opencodex-codex-version"] = version;
-        // Conditional GET: a client that already holds these bytes re-validates cheaply.
-        const ifNoneMatch = req.headers.get("if-none-match")?.trim();
-        if (serialized.etag && ifNoneMatch && ifNoneMatch === serialized.etag) {
-          return withCors(new Response(null, { status: 304, headers }), req, policy);
-        }
+        // No conditional handling: with no validator emitted, an If-None-Match on this route
+        // can only have been guessed or copied from elsewhere, and honoring it would
+        // reintroduce the cross-identity path above. Every request gets the full body.
         if (serialized.bytes !== undefined) headers["content-length"] = String(serialized.bytes);
         // HEAD returns identical status and headers with no body.
-        return withCors(
-          new Response(req.method === "HEAD" ? null : serialized.body, { status: 200, headers }),
-          req,
-          policy,
+        return withRemoteCatalogKeyId(
+          withCors(
+            new Response(req.method === "HEAD" ? null : serialized.body, { status: 200, headers }),
+            req,
+            policy,
+          ),
+          admission,
         );
       }
 
@@ -1166,6 +1395,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         if (!isAllowedRequestOrigin(req, policy)) {
           return withCors(formatErrorResponse(403, "origin_rejected", "cross-origin data-plane request blocked"), req, policy);
         }
+        const wantsDesktopConfig = url.searchParams.get("format") === "desktop-config";
+        if (wantsDesktopConfig && (url.searchParams.get("ids") === "cli" || url.searchParams.has("client_version"))) {
+          return jsonResponse({ error: "Desktop config format cannot use CLI or client-version selectors" }, 400, req, policy);
+        }
+        // The Integrations page reports whether a Cursor client has reached this proxy; the
+        // recorder keeps only a bounded User-Agent value and a timestamp, in memory.
+        recordCursorSeen(req.headers);
         let goModels;
         let modelEntitlements;
         try {
@@ -1185,7 +1421,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           }
           throw error;
         }
-        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeInputModalities, nativeOpenAiContextWindow, nativeOpenAiMaxOutputTokens, nativeOpenAiContextTier, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
         const { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } = await import("../codex/catalog/native-models");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
@@ -1235,11 +1471,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         const accountNativeSlugs = [...new Set(
           [...accountNativeSlugsBySelector.values()].flatMap(slugs => [...slugs]),
         )];
-        const desktopNativeSlugs = desktopVisibleNativeSlugs(config).filter(slug => (
-          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
-        ));
-        const goEnabled = filterCatalogVisibleModels(goModels, config);
-        const goOrdered = orderForSubagents(goEnabled, config.subagentModels);
+        const desktopInputs = buildDesktopDiscoveryInputs({
+          config, models: goModels, modelEntitlements,
+          desktopNativeCandidates: desktopVisibleNativeSlugs(config),
+        });
+        const desktopNativeSlugs = desktopInputs.nativeSlugs;
+        const goOrdered = desktopInputs.routedModels;
         // Claude Code / Claude Desktop gateway model discovery (GET /v1/models with
         // Anthropic-style headers; 003 G1-G8 + devlog 131). Entries use the official
         // ModelInfo shape incl. capabilities (effort ladder / thinking) — Desktop 3P can
@@ -1248,15 +1485,56 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // aliases; legacy claude-ocx-* ids keep decoding via resolveAlias. Detection:
         // anthropic-version header (Claude Code sends it) or explicit ?flavor=anthropic.
         // Codex catalog (client_version) and the OpenAI list shape below stay byte-identical.
-        const wantsAnthropicList = req.headers.get("anthropic-version") !== null
+        const wantsAnthropicList = wantsDesktopConfig || req.headers.get("anthropic-version") !== null
           || url.searchParams.get("flavor") === "anthropic";
+        /**
+         * Whether a NATIVE slug may carry a Fast sibling.
+         *
+         * Both halves are required. Upstream asserts the tier per model — the same
+         * `additional_speed_tiers` the Codex picker's own toggle is built from — but an
+         * operator capability override or the final wire resolution can still make the
+         * route ineligible, and `decideTier` would then drop the tier the row advertised.
+         *
+         * Declared here, above the Claude discovery call, because that call reads it while
+         * the raw OpenAI mapper further down does too; defining it there would leave this
+         * use in its temporal dead zone.
+         */
+        const nativeFastEligible = (metadataId: string): boolean =>
+          catalogFastRowEligible(config, { provider: OPENAI_CODEX_PROVIDER_ID, id: metadataId, native: true });
+
+        /**
+         * Whether a routed catalog row may carry a Fast sibling.
+         *
+         * A combo is its own namespace with no `config.providers` entry — declaring a
+         * provider named `combo` is rejected (combos/types.ts:191) — so provider lookup
+         * cannot classify it. Its aggregated `supportsServiceTier` is already true only
+         * when EVERY member supports the tier (aggregation.ts:201), which is the right
+         * rule for a row that fans out to all of them.
+         *
+         * Declared beside nativeFastEligible, above the Claude discovery call that reads
+         * both; defining it near the raw OpenAI mapper below would leave that use in its
+         * temporal dead zone.
+         */
+        const catalogRowFastEligible = (m: { provider: string; id: string; supportsServiceTier?: boolean }): boolean =>
+          catalogFastRowEligible(config, m);
+
         if (wantsAnthropicList && !url.searchParams.has("client_version")) {
+          if (wantsDesktopConfig) {
+            const models = config.claudeCode?.enabled === false ? [] : generateDesktop3pModels(
+              desktopInputs.nativeSlugs, desktopInputs.routedModels,
+              config.claudeCode?.desktopProfile, desktopInputs.nativeContextCap,
+            );
+            const response = jsonResponse({ version: 1, models }, 200, req, policy);
+            response.headers.set("Cache-Control", "no-store");
+            return response;
+          }
           if (config.claudeCode?.enabled === false) return jsonResponse({ data: [] }, 200, req, policy);
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
             desktopNativeSlugs,
-            goOrdered.map(m => ({ provider: m.provider, id: m.id, contextWindow: m.contextWindow })),
+            desktopInputs.routedModels,
             config.claudeCode?.desktopProfile,
+            desktopInputs.nativeContextCap,
           );
           const { buildAnthropicModelInfos } = await import("../claude/model-info");
           const { resolveAutoContext } = await import("../claude/context-windows");
@@ -1271,7 +1549,23 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             : idsParam === "desktop"
               ? "desktop3p" as const
               : (/^claude-code\//i.test(req.headers.get("user-agent") ?? "") ? "readable" as const : "desktop3p" as const);
-          const data = buildAnthropicModelInfos(desktopNativeSlugs, goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
+          const data = buildAnthropicModelInfos(
+            desktopNativeSlugs,
+            goOrdered,
+            resolveAutoContext(config.claudeCode),
+            idStyle,
+            activeDesktop3pAlias,
+            desktopInputs.nativeContextCap,
+            config.fastMode,
+            // Explicit opt-out omits the Fast predicate.
+            config.fastRows !== false
+              ? (model: { provider: string; id: string; supportsServiceTier?: boolean }) =>
+                model.provider === "native"
+                  ? nativeFastEligible(model.id)
+                  : catalogRowFastEligible(model)
+              : undefined,
+            { modelPickerOrder: config.modelPickerOrder, featured: config.subagentModels },
+          );
           return jsonResponse({ data }, 200, req, policy);
         }
         if (url.searchParams.has("client_version")) {
@@ -1305,6 +1599,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             accountNativeSlugs,
             accountNativeSlugsBySelector,
             config.keepNativeChatGptOnV1 === true,
+            config.modelPickerOrder,
           );
           return jsonResponse({
             models: applyNativeVisibility(
@@ -1339,6 +1634,16 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             reasoning_efforts: efforts.map(effort => grokEffortOption(effort, effort === defaultEffort)),
           };
         };
+        // Cursor's local-agent runtime (Private Inference build) reads api_types + capabilities
+        // to enable its effort control; every other consumer ignores them. See
+        // src/server/models-capabilities.ts.
+        const nativeLimits = nativeContextLimits(config);
+        const nativeContextInput = (metadataId: string) => {
+          const tier = nativeOpenAiContextTier(metadataId, nativeLimits);
+          return tier
+            ? { contextWindow: tier.defaultWindow, longContextWindow: tier.longWindow }
+            : { contextWindow: nativeOpenAiContextWindow(metadataId, nativeLimits) };
+        };
         const nativeModelRow = (id: string, metadataId = id) => ({
             id,
             object: "model",
@@ -1348,7 +1653,25 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
               nativeReasoningEfforts(metadataId),
               nativeDefaultReasoningEffort(metadataId),
             ),
+            ...modelCapabilityFields({
+              reasoningEfforts: nativeReasoningEfforts(metadataId),
+              // Cursor "Max Mode": advertise the family's default/long pair (272k/922k for
+              // GPT-5.6) so the client can pick per request; without a tier, the effective
+              // window is the only value.
+              ...nativeContextInput(metadataId),
+              maxOutputTokens: nativeOpenAiMaxOutputTokens(metadataId),
+              inputModalities: nativeInputModalities(metadataId),
+            }),
           });
+        // Resolved once per request, not per model: the global fast switch offers the fast
+        // identity to clients that have no Fast toggle of their own. Null when the switch is
+        // off, so the row mapper does no work and loads no adapter module.
+        const cursorFastIdForListing = config.fastMode === true
+          ? await (async () => {
+            const { cursorFastIdFor } = await import("../adapters/cursor/catalog");
+            return (modelId: string, provider = "cursor") => provider === "cursor" ? cursorFastIdFor(modelId) : undefined;
+          })()
+          : null;
         // Selector-active discovery follows the same complete supported set as the Codex catalog
         // for both bare and qualified rows. Without selectors, the live catalog continues to own
         // bare availability.
@@ -1369,33 +1692,88 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             return disabledModels.has(id) ? [] : [{ id, metadataId }];
           })
         );
+        // The projection is opt-in. Keep the default path free of Cursor install detection,
+        // and resolve the bundle table once for the whole list rather than once per row.
+        const effortRowsEnabled = config.cursorEffortRows === true;
+        // Explicit opt-out skips policy resolution and additional rows.
+        const fastRowsEnabled = config.fastRows !== false;
+        // One inventory serves both grammars; building it twice would double the work on a
+        // hot path for no benefit.
+        const effortRowKnownIds = effortRowsEnabled || fastRowsEnabled
+          ? knownEffortRowIds(config)
+          : undefined;
+        const privateInference = effortRowsEnabled
+          ? detectCursorInstalls().find(install => install.build === "private-inference")
+          : undefined;
+        const cursorEffortTable = effortRowsEnabled
+          ? (deps.managementApi?.loadCursorEffortTable ?? loadCursorEffortTable)(privateInference)
+          : null;
+        const expandedNativeModelRow = (id: string, metadataId = id) => {
+          const reasoningEfforts = nativeReasoningEfforts(metadataId);
+          return expandCursorEffortRow(nativeModelRow(id, metadataId), reasoningEfforts, config, {
+            knownIds: effortRowKnownIds,
+            table: cursorEffortTable,
+            supportsReasoning: reasoningEfforts.length > 0,
+          }).flatMap(row => expandFastRow(
+            row,
+            // Only the BASE row earns a fast sibling. An effort row already spent the
+            // grammar, and the parser requires the stripped base to be routable, so
+            // `<base>--<effort>--fast` would publish a row no ingress can resolve.
+            row.id === id && nativeFastEligible(metadataId),
+            config,
+            effortRowKnownIds,
+          ));
+        };
+        const routedRows = await Promise.all(uniqueCatalogModelsForRawPublicList(goOrdered).map(async m => {
+          // Same rule as the anthropic branch: with the global fast switch on, a client
+          // that has no Fast toggle is offered the fast identity directly. An operator
+          // alias is an explicit decision and still wins.
+          const fastModelId = cursorFastIdForListing?.(m.id, m.provider);
+          const publicId = m.alias ?? `${m.provider}/${fastModelId ?? m.id}`;
+          const isCombo = m.provider === "combo" && exactComboSlugs.has(publicId);
+          const provider = config.providers[m.provider];
+          const effective = provider
+            ? (await import("../providers/default-aliases")).effectiveModelAliases(
+                config,
+                provider,
+                knownModelIdsForProvider(m.provider, provider, config),
+              ).get(m.id)
+            : undefined;
+          const row = {
+            id: publicId,
+            object: "model",
+            created: 0,
+            // This endpoint is an OpenAI-compatible inbound contract. Some clients use
+            // owned_by as an adapter selector, so a virtual combo must name that wire
+            // adapter rather than the internal catalog authority marker.
+            owned_by: isCombo ? "openai" : (m.owned_by ?? m.provider),
+            ...(isCombo ? { is_combo: true } : {}),
+            ...(effective ? { alias_of: `${provider?.alias || m.provider}/${effective.alias}` } : {}),
+            ...grokEffortFields(m.reasoningEfforts ?? [], m.defaultReasoningEffort),
+            ...modelCapabilityFields({
+              reasoningEfforts: m.reasoningEfforts,
+              // contextWindow is already the post-cap effective value; contextCap is the raw
+              // operator knob and over-reports models whose real window sits below it.
+              contextWindow: m.contextWindow,
+              maxOutputTokens: m.maxOutputTokens,
+              inputModalities: m.inputModalities,
+            }),
+          };
+          return expandCursorEffortRow(row, m.reasoningEfforts, config, {
+            knownIds: effortRowKnownIds,
+            table: cursorEffortTable,
+            supportsReasoning: (m.reasoningEfforts ?? []).length > 0,
+          }).flatMap(expanded => expandFastRow(
+            expanded,
+            expanded.id === row.id && catalogRowFastEligible(m),
+            config,
+            effortRowKnownIds,
+          ));
+        }));
         const data = [
-          ...visibleNatives.map(id => nativeModelRow(id)),
-          ...visibleAccountNatives.map(({ id, metadataId }) => nativeModelRow(id, metadataId)),
-          ...await Promise.all(uniqueCatalogModelsForRawPublicList(goOrdered).map(async m => {
-            const publicId = m.alias ?? `${m.provider}/${m.id}`;
-            const isCombo = m.provider === "combo" && exactComboSlugs.has(publicId);
-            const provider = config.providers[m.provider];
-            const effective = provider
-              ? (await import("../providers/default-aliases")).effectiveModelAliases(
-                  config,
-                  provider,
-                  knownModelIdsForProvider(m.provider, provider, config),
-                ).get(m.id)
-              : undefined;
-            return {
-              id: publicId,
-              object: "model",
-              created: 0,
-              // This endpoint is an OpenAI-compatible inbound contract. Some clients use
-              // owned_by as an adapter selector, so a virtual combo must name that wire
-              // adapter rather than the internal catalog authority marker.
-              owned_by: isCombo ? "openai" : (m.owned_by ?? m.provider),
-              ...(isCombo ? { is_combo: true } : {}),
-              ...(effective ? { alias_of: `${provider?.alias || m.provider}/${effective.alias}` } : {}),
-              ...grokEffortFields(m.reasoningEfforts ?? [], m.defaultReasoningEffort),
-            };
-          })),
+          ...visibleNatives.flatMap(id => expandedNativeModelRow(id)),
+          ...visibleAccountNatives.flatMap(({ id, metadataId }) => expandedNativeModelRow(id, metadataId)),
+          ...routedRows.flat(),
         ];
         return jsonResponse({ object: "list", data }, 200, req, policy);
       }
@@ -1423,7 +1801,9 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
           let response: Response;
           try {
-            response = await handleResponsesCompact(req, config, logCtx, turnAdmissionLease, admission);
+            response = await handleResponsesCompact(req, config, logCtx, turnAdmissionLease, admission, {
+              onRequestBodyRead: () => disableResponsesRequestTimeout(req, requestServer),
+            });
           } catch {
             response = formatErrorResponse(500, "server_error", "Unexpected compact request failure");
           }
@@ -1509,7 +1889,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...admissionFields(admission),
         };
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
-          const response = await handleSearch(req, config, logCtx, turnAdmissionLease);
+          const response = await handleSearch(req, config, logCtx, turnAdmissionLease, admission);
           addFinalRequestLog(requestId, start, logCtx, response.status,
             response.status === 499 ? { closeReason: "client_cancel" } : undefined);
           return withCors(response, req, policy);
@@ -1611,7 +1991,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // pre-translation stream + native passthrough callbacks) — do not re-wrap the
         // translated Anthropic stream here.
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => withCors(
-          await handleClaudeMessages(req, config, logCtx, { requestId, start, turnAdmissionLease }, policy),
+          await handleClaudeMessages(req, config, logCtx, { requestId, start, turnAdmissionLease, admission }, policy),
           req,
           policy,
         ));
@@ -1742,13 +2122,65 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         return withCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, policy);
       }
 
-      const guiSessionCandidate = req.method === "GET" && (url.pathname === "/" || !url.pathname.includes("."))
-        ? issueGuiSession(req, config, managementAuth)
-        : null;
-      // Dedicated bootstrap path: answer without requiring a packaged GUI build, so the
-      // Vite dev server can mint an origin-bound loopback session on a fresh checkout.
-      if (url.pathname === "/opencodex-session" && guiSessionCandidate) {
-        return serveSessionBootstrap(guiSessionCandidate);
+      if (url.pathname === "/opencodex-session") {
+        if (req.method === "GET") {
+          const session = issueGuiSession(req, config, managementAuth, {
+            trustedTailscaleIngress: ingress === "hub-management",
+          });
+          return session
+            ? withManagementCors(serveSessionBootstrap(session), req, config)
+            : withManagementCors(new Response(null, { status: 401, headers: { "Cache-Control": "no-store" } }), req, config);
+        }
+        if (req.method === "POST") {
+          // This endpoint is reachable WITHOUT a credential — that is the point of a pairing
+          // exchange — so the body limit has to hold against a caller who controls the
+          // framing. A declared Content-Length is a claim, not a bound: omit the header and
+          // `Number(null ?? "0")` is 0, send `Transfer-Encoding: chunked` and there is no
+          // header at all. Both used to pass the pre-check and land in `req.text()`, which
+          // buffers whatever arrives. The post-check then measured a string the process had
+          // already been forced to hold.
+          //
+          // So the declared length is only a cheap early reject, and the real bound is
+          // applied while reading: stop at limit+1 bytes and never accumulate more.
+          const declaredLength = Number(req.headers.get("content-length") ?? "0");
+          if (!Number.isFinite(declaredLength) || declaredLength > GUI_PAIRING_EXCHANGE_BODY_LIMIT) {
+            return withManagementCors(Response.json({ error: "pairing exchange body too large" }, { status: 413, headers: { "Cache-Control": "no-store" } }), req, config);
+          }
+          const bounded = await readBoundedRequestText(req, GUI_PAIRING_EXCHANGE_BODY_LIMIT);
+          if (bounded === null) {
+            return withManagementCors(Response.json({ error: "pairing exchange body too large" }, { status: 413, headers: { "Cache-Control": "no-store" } }), req, config);
+          }
+          const text = bounded;
+          let body: unknown;
+          try {
+            body = JSON.parse(text);
+          } catch {
+            return withManagementCors(Response.json({ error: "invalid pairing exchange body" }, { status: 400, headers: { "Cache-Control": "no-store" } }), req, config);
+          }
+          if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body as Record<string, unknown>).length !== 1
+            || typeof (body as Record<string, unknown>).grant !== "string") {
+            return withManagementCors(Response.json({ error: "invalid pairing exchange body" }, { status: 400, headers: { "Cache-Control": "no-store" } }), req, config);
+          }
+          const pairing = managementAuth.available
+            ? consumeGuiPairingGrant(req, body, config, managementAuth, Date.now(), {
+              ingress: ingress === "hub-management" ? "hub-management" : "public",
+              peerAddress: requestServer.requestIP(req)?.address ?? null,
+              tailscaleUser: ingress === "hub-management" ? req.headers.get("Tailscale-User-Login") : null,
+              browserOrigin: req.headers.get("Origin") ?? "",
+            })
+            : null;
+          if (pairing && "allowed" in pairing) {
+            return withManagementCors(Response.json({ error: "pairing exchange refused" }, {
+              status: 429,
+              headers: { "Cache-Control": "no-store", "Retry-After": String(pairing.retryAfterSeconds) },
+            }), req, config);
+          }
+          return pairing
+            ? withManagementCors(serveSessionBootstrap(pairing), req, config)
+            : withManagementCors(new Response(null, { status: 401, headers: { "Cache-Control": "no-store" } }), req, config);
+        }
+        return withCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, policy);
       }
       // Build provenance answers even without a packaged GUI build: the file is written
       // into $OPENCODEX_HOME by image builds, and /build-info.json must report it in
@@ -1759,7 +2191,18 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           return withCors(jsonResponse(buildInfo), req, policy);
         }
       }
-      const guiFile = serveGuiFile(url.pathname, undefined, guiSessionCandidate ?? undefined);
+      const guiSessionCandidate = req.method === "GET" && (url.pathname === "/" || !url.pathname.includes("."))
+        ? issueGuiSession(req, config, managementAuth, {
+          trustedTailscaleIngress: ingress === "hub-management",
+        })
+        : null;
+      const guiFile = serveGuiFile(
+        url.pathname,
+        undefined,
+        guiSessionCandidate ?? undefined,
+        config.runtimeRole ?? "standalone",
+        isApiAuthRequired(config),
+      );
       if (guiFile) return guiFile;
       if (url.pathname === "/" && req.method === "GET") {
         return jsonResponse(rootFallbackPayload());
@@ -2007,7 +2450,25 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         throw error;
       }
     }
+    if (managementIngressPort !== null) {
+      try {
+        managementIngressServer = Bun.serve<WsData>({
+          ...serveOptions,
+          port: managementIngressPort,
+          hostname: "127.0.0.1",
+        });
+      } catch (error) {
+        // Preserve the management bind failure while synchronously initiating rollback of every
+        // listener already opened in this startup transaction. startServer must not become async.
+        for (const bound of [loopbackServer, server]) {
+          if (!bound) continue;
+          try { void bound.stop(true); } catch { /* report the original bind error */ }
+        }
+        throw error;
+      }
+    }
   } catch (error) {
+    unregisterQuotaAutoRefresh?.();
     userCostOverlayReconciler?.stop();
     backgroundLifecycle?.releaseAfterFailedStart();
     void nativeMainLifecycle.release();
@@ -2017,6 +2478,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   bindNativeMainStartupLifecycle(server, nativeMainLifecycle);
   const nativeStop = server.stop.bind(server);
   const loopbackListenerRef = loopbackServer;
+  const managementIngressRef = managementIngressServer;
   Object.defineProperty(server, "stop", {
     configurable: true,
     value: async (closeActiveConnections?: boolean): Promise<void> => {
@@ -2028,13 +2490,28 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...(loopbackListenerRef
             ? [() => loopbackListenerRef.stop(closeActiveConnections)]
             : []),
+          ...(managementIngressRef
+            ? [() => managementIngressRef.stop(closeActiveConnections)]
+            : []),
           async () => {
-            userCostOverlayReconciler?.stop();
+            try {
+              userCostOverlayReconciler?.stop();
+            } finally {
+              unregisterQuotaAutoRefresh?.();
+            }
           },
         ],
         async () => {
-          await backgroundLifecycle.release();
-          await releaseNativeMainStartupLifecycle(server);
+          try {
+            await backgroundLifecycle.release();
+            await releaseNativeMainStartupLifecycle(server);
+          } finally {
+            // icacls.exe from hardenConfigDir() holds the config dir open; a caller that
+            // removes the dir right after stop() settles would hit EPERM/EBUSY on Windows
+            // otherwise. Runs even when an earlier release rejected — that rejection still
+            // propagates, but not before the child is drained.
+            await flushConfigDirHardening(startupConfigDir);
+          }
         },
       );
     },
@@ -2080,6 +2557,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     console.warn(`   remote clients. Not for shared or multi-tenant hosts.`);
   }
 
+  if (managementIngressServer) {
+    const managementPort = managementIngressServer.port ?? managementIngressPort;
+    console.log(`🔒 Hub management ingress active on http://127.0.0.1:${managementPort}`);
+    console.log(`   GUI and /api/* only; data, health, readiness, and WebSockets are disabled.`);
+  }
+
   // Prime pool-account quota in the background so the rotation engine has real
   // usage scores from the first routing decision, even when the dashboard is
   // never opened (the common CLI/WSL case). Fire-and-forget: never blocks the
@@ -2115,6 +2598,15 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   const labConfigDir = getConfigDir();
   if (labActivationRequired(config, labConfigDir)) {
     activateLab(config, labConfigDir);
+  }
+
+  // Reset-credit auto-redemption (#822) is opt-in; a default install constructs nothing here.
+  // Activation is synchronous (timer registration only); network work happens on the timer.
+  if (config.resetCreditAutoRedeem?.enabled === true) {
+    activateResetCreditAutoRedeem(config, {
+      accountId: MAIN_CODEX_ACCOUNT_ID,
+      ...createResetCreditWhamClient(config, MAIN_CODEX_ACCOUNT_ID),
+    });
   }
 
   return server;

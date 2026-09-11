@@ -54,6 +54,7 @@ ChatGPT bearer auth。由于注入的 `base_url` 指向 opencodex，proxy 会把
   `openai-responses` provider 的 id，该 endpoint 必须实现 OpenAI Images API。显式选择会失败即关闭，
   不会 fallback 到其他付费上游。这里不接受 registry 管理的 provider id；省略 `images.provider`
   即可使用内置的 OpenAI tiers。
+- **xAI Imagine（Grok OAuth）中继：** 当 `images.bridgeEnabled` 为 `true`、未设置 `images.provider`，且配置了 `xai` provider 时，`/v1/images/generations` 和 `/v1/images/edits` 会发到 `https://api.x.ai/v1`。使用哪种凭据由 provider 的 `authMode` 决定：`"oauth"` 时复用 `ocx login xai` 获得的 Grok CLI 授权，其他模式则使用 provider 的 API key。OAuth 登录不会启用 key 方式的 provider，反之亦然。ChatGPT 凭据不会被转发。若凭据缺失，代理返回 400，而不会向 ChatGPT 计费。显式设置 `images.provider` 后，`/v1/images` 由该 provider 接管，其校验错误原样返回，不会再尝试 xAI 中继。该中继会把 Codex 的 `size` / `aspect_ratio` 映射到 xAI Imagine 请求体，并返回同样的 `{created, data:[{b64_json}]}` 形状。整批（inline `b64_json` 与下载的 URL）解码字节与 base64 编码输出合计不超过 100 MiB；超出则返回 502。若 xAI 返回的是图片 URL 而非内联字节，代理会不带凭据自行下载：URL 必须是公开 HTTPS（不允许重定向、`file:`、回环或私有地址），每个文件上限 50 MiB，结果作为本地 artifact 保存，仅通过需认证的管理端点提供。这与仍仅支持 API key 的 Responses Image Bridge 循环相互独立。
 - **Google Antigravity（CCA）fallback：** 当既没有 OpenAI forward 候选，也没有已配置的 keyed
   provider 时，`/v1/images/generations`（不是 `/images/edits`）会 fallback 到 Antigravity
   **Cloud Code Assist** endpoint，并使用 `gemini-3.1-flash-image` 模型。该 fallback 也会在
@@ -195,6 +196,12 @@ Codex 显示的模型来自一个磁盘上的 catalog（默认是 `$CODEX_HOME/o
 历史记录编码成上游 function tool，再在 Codex 收到结果前，把流式 function-call lifecycle 还原成
 `custom_tool_call`。原生 OpenAI forward routing 和已支持的 `apply_patch` custom tool 保持不变。
 
+路由的 code-mode 轮次还会在首次调用前收到宿主对嵌套辅助工具的规则：`tools.apply_patch`
+接收一个字符串，首尾必须是没有额外包装的独立补丁标记行；isolate 中没有 `import`，长时间运行的
+命令通过 `write_stdin` 轮询。如果原生路由 Responses、Kiro 或 Cursor 路径上的 code-mode exec
+结果仍包含宿主的某条失败消息，opencodex 会追加一行提示，指出对应规则。此变更不会重写模型的
+代码或补丁文本。
+
 所选 provider 必须支持 function/tool calling。不支持 tool call 的 text-only provider 无法使用 `exec`、
 Browser 或 Computer Use。原生 OpenAI 条目会保持其上游 tool mode 不变。
 
@@ -259,8 +266,12 @@ provider 形式一样，从 `OPENCODEX_API_AUTH_TOKEN` 传入 `x-opencodex-api-k
    所有发现到的模型。一个不在 allowlist 里的 id 永远不会进入 catalog。
 2. **`disabledModels`**（顶层） - 会同时隐藏 catalog 和 `/v1/models` 中的模型，并把裸原生 GPT slug
    切成 `visibility: "hide"`。
-3. **`liveModels: false` 且 `models` 为空** - 当 live discovery 关闭而 `models` 为空或省略时，opencodex
-   不会为那个 provider 暴露任何路由模型。
+3. **`liveModels: false`** — `liveModels: false` 时，若 `models` 为空或省略，初始列表先加入已配置的 `defaultModel`，
+   再加入 `retainModels`，重复 ID 仅保留首次出现的位置。若显式设置了非空 `models`，则按
+   `models`、`retainModels` 顺序构建，不会自动加入另一个 `defaultModel`；仍可将该模型明确写入
+   `models` 或 `retainModels`。这些字段均未提供 ID 时，初始列表为空。此顺序不保证最终选择器的显示顺序。
+   `selectedModels`、`disabledModels` 和提供商禁用策略仍然适用。`authMode: "forward"` 保留原有独立分支，
+   不使用此静态路由列表。这些规则不改变实时发现失败时的回退行为。
 4. **Cursor `GetUsableModels`** - Cursor adapter 通过它的 protobuf `GetUsableModels` RPC 发现模型，而不是
    `/models`，所以 Cursor 侧的变动会独立于其他 provider 改变哪些 id 可见。
 5. **缓存和 `ocx sync`** - live catalog 的缓存时间大约是五分钟（`modelCacheTtlMs`，默认 `300000`）。
@@ -301,18 +312,19 @@ fallback 行为，参见 [Sub-agent Surface](/guides/sub-agent-surface/)。
 
 ## Codex 账号预热
 
-当把一个 ChatGPT 账号加入 Codex 账号池时，opencodex 会在持久化前向 Codex Responses backend
-发送一个小型 streaming 请求来验证它。该请求使用真正的 Responses item 数组
-（`input: [{ type: "message", ... }]`），等待 `response.completed`，并默认使用 `gpt-5.4-mini`。
-如果该模型返回 HTTP 400，则会改用 `gpt-5.5` 重试；结构化的上游错误详情会被展示给用户，但不会暴露
-原始响应正文。后台重新验证是独立功能，默认关闭；只有在启用 Token Guardian、将 `chatgpt` 刷新策略设为
-`proactive`，并且 `tokenGuardian.codexWarmupEnabled` 为 true 时才会运行。
+添加或重新认证账号时，通常会在保存前发送一个小型模型请求并等待 `response.completed`。默认使用 `gpt-5.4-mini`，HTTP 400 时改用 `gpt-5.5` 重试。公开错误仅包含固定分类，不包含原始响应正文。
+
+如果新 OAuth 凭据的已认证用量查询确认5小时、每周或每月额度耗尽，则不调用模型而直接保存账号，显示**等待验证**。重启或刷新令牌也不会使其可用。额度恢复后刷新额度：只有完整的最新用量显示有余额，才会发送一个小型验证请求；请求完成后账号才可用于路由。查询或验证失败将保留等待状态。普通状态轮询不会发送该请求。初次注册时用量未知仍需常规预热验证。
+
+`ocx account refresh openai` 和 `ocx account list openai --quota --refresh` 仅查询用量。模型验证会消耗配额，因此需要用户的仪表板会话：配额恢复后，打开 `ocx gui` 并点击 **Refresh quotas**。无界面主机也需要通过浏览器访问其仪表板；仅凭管理员令牌无法授权验证。暂停的账号可以完成验证，但不会因此恢复或被选中。模型授权错误会一直显示，直到验证或重新登录成功。
+
+后台重新验证是独立功能，默认关闭。它要求 Token Guardian、`openai` 的 `proactive` 刷新策略及 `tokenGuardian.codexWarmupEnabled`，并跳过等待注册验证的账号。
 
 ## 恢复原生 Codex
 
-opencodex 绝不会把你困住。**`ocx stop` 是完全恢复原生 Codex 的单一命令** —— 它会停止 proxy、
-停止后台服务（如已安装），并剥除所有注入的行和路由的目录条目，使普通的 `codex` 完全像 opencodex
-从未存在过一样工作：
+`ocx stop` 会停止 proxy 和已安装的后台服务，然后尝试恢复原生 Codex。OpenCodex 只移除能够确认归属的路由配置；如果无法安全恢复配置文件，会报告恢复未完成。
+
+如果当前 config 或 profile 与保存的原始内容不同，且日志缺少该文件注入状态的哈希值，自动快照恢复会保留两个文件和日志，不作修改。已经与原始内容相同的文件不会重写。对已路由配置的再次注入也会拒绝使用这种未确认的基线；原生配置可以建立新的快照。详见[恢复规则](/guides/codex-integration/#recovery-without-injection-hashes)。
 
 ```bash
 ocx stop       # stop the proxy + service, restore native Codex

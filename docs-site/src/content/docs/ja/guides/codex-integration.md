@@ -40,6 +40,7 @@ Codex の組み込み `image_gen` ツールは、`/v1/responses` を経由しま
 失敗。壊れた/期限切れのプール認証情報が、別途請求される API 使用量の背後に隠れることはありません。
 - **明示的なカスタム プロバイダー:** `images.provider` をカスタム API キーの ID に設定します。
 `openai-responses` プロバイダー。そのエンドポイントは OpenAI Images API を実装します。明示的な選択はクローズに失敗し、別の有料アップストリームにフォールバックすることはありません。レジストリで管理されているプロバイダー ID はここでは受け入れられません。組み込みの OpenAI 層を使用するには、`images.provider` を省略します。
+- **xAI Imagine (Grok OAuth) リレー:** `images.bridgeEnabled` が `true` で、`images.provider` が未設定、かつ `xai` プロバイダーが設定されている場合、`/v1/images/generations` と `/v1/images/edits` は `https://api.x.ai/v1` に送られます。使われる資格情報はプロバイダーの `authMode` で決まります。`"oauth"` なら `ocx login xai` の Grok CLI グラントを再利用し、それ以外ならプロバイダーの API キーを使います。OAuth ログインがキー方式のプロバイダーを有効にすることはなく、その逆もありません。ChatGPT の資格情報は転送されません。資格情報が無い場合、プロキシは ChatGPT に課金せず 400 を返します。`images.provider` を明示すると `/v1/images` はそのプロバイダーが受け持ち、その検証エラーがそのまま返され、xAI リレーは試行されません。リレーは Codex の `size` / `aspect_ratio` を xAI Imagine のボディに写し、同じ `{created, data:[{b64_json}]}` 形を返します。バッチ全体（インライン `b64_json` とダウンロードした URL）のデコード済みバイトと base64 エンコード出力は合わせて 100 MiB 未満です。上限を超えるバッチは 502 を返します。xAI がインラインのバイト列ではなく画像 URL を返した場合、プロキシは資格情報なしで自ら取得します。URL は公開 HTTPS でなければならず（リダイレクト、`file:`、ループバックやプライベートアドレスは不可）、1 ファイルあたり 50 MiB が上限で、結果はローカルのアーティファクトとして保存され、認証済みの管理エンドポイント経由でのみ配信されます。これは API キー専用の Responses Image Bridge ループとは独立です。
 - **Google Antigravity (CCA) フォールバック:** OpenAI 前方候補でもキー付きでもない場合
 プロバイダーが構成されている場合、`/v1/images/generations` (`/images/edits` ではありません) は、`gemini-3.1-flash-image` モデルを使用して Antigravity **Cloud Code Assist** エンドポイントにフォールバックします。フォールバックは、OpenAI 候補が構成されていない場合だけでなく、OpenAI 認証の解決が失敗した後 (ChatGPT 資格情報の期限切れまたは欠落など) にも起動されます。これには `ocx login google-antigravity` が必要です。 OAuth トークンは、固定された CCA レジストリ ホストにのみ送信され、構成レベルの `baseUrl` オーバーライドには送信されません。応答は、Codex が期待するのと同じ `{created, data:[{b64_json}]}` 形状で返されます。
 - **どちらでもない:** プロキシは一般的な 404 ではなく明確なエラーを返します。 ルーティングされたプロバイダー
@@ -146,6 +147,14 @@ Codex の `exec` custom-tool grammar を受け付けない key-auth Responses pr
 `custom_tool_call` へ復元します。ネイティブ OpenAI の forward routing と、対応済みの `apply_patch` custom tool は
 変更されません。
 
+ルーティングされた code-mode のターンには、最初の呼び出し前に、ネストされたヘルパーに関する
+ホストの規則も伝えられます。`tools.apply_patch` は、装飾を付けないパッチマーカー行で始まり、
+同様のマーカー行で終わる単一の文字列を受け取ります。isolate では `import` を使用できず、
+長時間実行されるコマンドは `write_stdin` でポーリングします。ネイティブのルーティング済み Responses、
+Kiro、または Cursor の経路で、code-mode の exec 結果にホストの失敗メッセージがまだ含まれている場合、
+opencodex は該当する規則を示す 1 行のヒントを追加します。この変更でモデルのコードやパッチのテキストを
+書き換えることはありません。
+
 選択した provider は function/tool calling をサポートしている必要があります。tool call に対応しない text-only
 provider では `exec`、Browser、Computer Use は使用できません。ネイティブ OpenAI の項目は上流の tool mode を
 そのまま維持します。
@@ -196,8 +205,14 @@ ocx sync-cache
 空または省略すると、検出されたすべてのモデルが公開されます。ホワイトリストにない ID はカタログに到達しません。
 2. **`disabledModels`** (トップレベル) — カタログと `/v1/models` の両方からモデルを非表示にし、反転します
 裸のネイティブ GPT スラッグを `visibility: "hide"` にします。
-3. **`liveModels: false` と空の `models`** — ライブ検出がオフで、`models` が空の場合、または
-省略すると、opencodex はそのプロバイダーのルーティング モデルを公開しません。
+3. **`liveModels: false`** — `liveModels: false` で `models` が空または省略されている場合、初期一覧には設定済みの
+   `defaultModel`、`retainModels` の順で ID を追加し、重複は最初の出現だけを残します。
+   空でない `models` が明示されている場合は、`models`、`retainModels` の順になり、別の
+   `defaultModel` を暗黙に追加しません。そのモデルも `models` または `retainModels` に明示すれば
+   含められます。どのフィールドにも ID がなければ初期一覧は空です。この順序は最終的なピッカーの
+   表示順を保証しません。`selectedModels`、`disabledModels`、プロバイダーの無効化は引き続き適用されます。
+   `authMode: "forward"` は別の分岐を維持し、このルーティング用の静的一覧を使いません。
+   これらの規則はライブ検出失敗時のフォールバックを変更しません。
 4. **Cursor `GetUsableModels`** — Cursor アダプターはその protobuf を通じてモデルを検出します。
 `/models` ではなく `GetUsableModels` RPC であるため、カーソル側の変更により、他のプロバイダーとは独立して表示される ID が変更される可能性があります。
 5. **キャッシュと `ocx sync`** - ライブ カタログは約 5 分間キャッシュされます (`modelCacheTtlMs`、
@@ -226,11 +241,19 @@ ocx service install    # persistent: auto-starts on login and respawns on crash
 
 ## Codex アカウントのウォームアップ
 
-ChatGPT アカウントが Codex アカウント プールに追加されると、opencodex は、Codex Response バックエンドへの小さなストリーミング リクエストで永続化する前にそれを検証します。リクエストは実際の応答項目配列 (`input: [{ type: "message", ... }]`) を使用し、`response.completed` を待機し、デフォルトは `gpt-5.4-mini` になります。そのモデルが HTTP 400 を返した場合、`gpt-5.5` で再試行します。構造化されたアップストリーム エラーの詳細は、生の応答本体を公開することなく表示されます。バックグラウンドの再検証は個別に行われ、デフォルトではオフになっています。これは、トークン ガーディアンが有効で、`chatgpt` 更新ポリシーが `proactive` で、`tokenGuardian.codexWarmupEnabled` が true の場合にのみ実行されます。
+アカウントの追加・再認証では通常、保存前に小さなモデルリクエストで `response.completed` を確認します。既定モデルは `gpt-5.4-mini` で、HTTP 400 の場合は `gpt-5.5` で再試行します。公開エラーには固定の分類のみを表示し、生の応答本文は公開しません。
+
+新しい OAuth トークンによる使用量取得で5時間・週次・月次の上限到達が確認された場合、モデルを呼ばずに保存し、**検証待ち**と表示します。再起動やトークン更新後も使用できません。上限回復後に使用量を更新すると、十分な空き容量を示す完全な最新情報を確認してから小さなモデルリクエストを送り、完了した場合のみ使用可能になります。取得や検証の失敗では待機状態を維持します。通常の状態ポーリングは検証リクエストを送りません。初回登録時の使用量が不明な場合は通常の検証が必要です。
+
+`ocx account refresh openai` と `ocx account list openai --quota --refresh` は使用量のみを取得します。モデル検証はクォータを消費するため、人間のダッシュボードセッションが必要です。回復後に `ocx gui` を開き、**Refresh quotas** をクリックしてください。ヘッドレスホストでもブラウザーからそのダッシュボードにアクセスします。管理者トークンだけでは検証できません。一時停止中でも検証できますが、アカウントの再開や選択は行いません。モデル認証エラーは検証または再認証に成功するまで表示されます。
+
+バックグラウンド再検証は別機能で既定では無効です。Token Guardian、`openai` の `proactive` 更新ポリシー、`tokenGuardian.codexWarmupEnabled` が必要で、登録検証待ちのアカウントは除外します。
 
 ## ネイティブ Codexの復元
 
-opencodex は決してあなたを罠にはめることはありません。 **`ocx stop` は、ネイティブ Codex に完全に戻す単一のコマンドです**。プロキシを停止し、バックグラウンド サービスがインストールされている場合はそれを停止し、挿入されたすべての行とルーティングされたカタログ エントリを削除するため、プレーンな `codex` は、opencodex が存在しなかったかのように正確に動作します。
+`ocx stop` はプロキシとインストール済みのバックグラウンドサービスを停止し、ネイティブ Codex の復元を試みます。OpenCodex は所有を確認できるルーティング設定を削除し、設定ファイルを安全に復元できない場合は未完了として報告します。
+
+現在の設定またはプロファイルが保存された元の内容と異なり、そのファイルの注入後の状態のハッシュがジャーナルにない場合、自動復元は両方のファイルとジャーナルを変更せずに残します。元の内容と同じファイルは再書き込みしません。ルーティング済み設定への再注入も、この未確認の状態では拒否されます。ネイティブ設定では新しいスナップショットを作成できます。[復元規則](/guides/codex-integration/#recovery-without-injection-hashes)を参照してください。
 
 ```bash
 ocx stop       # stop the proxy + service, restore native Codex

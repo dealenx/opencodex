@@ -25,12 +25,13 @@ import {
 } from "../../oauth";
 import { OAuthMutationBusyError, removeCredential } from "../../oauth/store";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
+import { emailMaskingEnabled } from "../../lib/privacy";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/key-providers";
 import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
-import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderAccountQuotas, fetchProviderQuotaReports, supportsPerAccountQuota } from "../../providers/quota";
+import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderAccountQuotas, fetchProviderApiKeyQuotas, fetchProviderQuotaReports, providerOAuthAccountQuotaMode, providerApiKeyQuotaMode, readPassiveProviderAccountQuotas } from "../../providers/quota";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import {
@@ -65,6 +66,12 @@ import type { PersistedUsageAttempt } from "../../usage/log";
 import { AUTH_MATRIX, isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "../auth-cors";
 import { applySystemEnvToggle } from "../system-env";
 import { buildApiAccessEndpoints } from "./api-access";
+import {
+  abortApiKeyRotation,
+  commitApiKeyRotation,
+  removeExpiredApiKeyRotations,
+  startApiKeyRotation,
+} from "./api-key-rotation";
 
 import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
@@ -122,6 +129,11 @@ function validateKeyName(
 
 export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<Response | null> {
   const { req, url, config, deps, syncClaudeAgentDefsBestEffort } = ctx;
+
+  if (url.pathname === "/api/accounts/events" && req.method === "GET") {
+    const { accountSelectionStream } = await import("./account-selection-stream");
+    return accountSelectionStream(req, () => ctx.sessionControl?.isCurrent(req, config) === true);
+  }
 
   // Which providers support real OAuth login (drives the GUI's "Log in with …" buttons).
   if (url.pathname === "/api/oauth/providers" && req.method === "GET") {
@@ -222,7 +234,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   if (url.pathname === "/api/oauth/status" && req.method === "GET") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
-    const status = getLoginStatus(provider);
+    // Resolved here, at the request boundary that already holds the config, and passed down.
+    // getLoginStatus stays free of config I/O. This route does not re-mask afterwards: it
+    // consumes the already-projected status rather than redacting a second time.
+    const status = getLoginStatus(provider, emailMaskingEnabled(config));
     return jsonResponse(status);
   }
 
@@ -248,7 +263,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   if (url.pathname === "/api/oauth/accounts" && req.method === "GET") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
-    const status = getLoginStatus(provider);
+    const quotaMode = providerOAuthAccountQuotaMode(provider);
+    const quotaProvider = config.providers[provider];
     const { getAccountSet } = await import("../../oauth/store");
     const {
       oauthAccountHealthFields,
@@ -257,7 +273,7 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     } = await import("../../oauth/health");
     const projectAccounts = () => {
       const set = getAccountSet(provider);
-      const current = getLoginStatus(provider);
+      const current = getLoginStatus(provider, emailMaskingEnabled(config));
       return {
         activeAccountId: current.activeAccountId ?? null,
         accounts: (current.accounts ?? []).map(summary => {
@@ -268,19 +284,26 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
               needsReauth: summary.needsReauth === true,
               reauthReason: summary.needsReauth === true ? "refresh_failed" : undefined,
             });
-          return { ...summary, ...oauthAccountHealthFields(provider, summary.id, health) };
+          return { ...summary, ...oauthAccountHealthFields(provider, summary.id, health), quotaMode };
         }),
       };
     };
     // Per-account rate limits: Anthropic reports usage per credential, so every logged-in
     // account can show its own 5h/weekly bars (not just the active one). Opt-in via ?quota=1
     // so the plain account list stays a cheap local read; ?refresh=1 bypasses the TTL.
-    const wantQuota = url.searchParams.get("quota") === "1" && supportsPerAccountQuota(provider);
-    if (!wantQuota) return jsonResponse(projectAccounts());
+    const wantQuota = url.searchParams.get("quota") === "1" && quotaMode === "probe";
+    // Meta publishes no quota endpoint: its usage is observed in-band on streaming turns
+    // and read back from the cache here. `?refresh=1` is accepted and ignored on this
+    // path rather than rejected -- the GUI sends it for every provider on a manual
+    // refresh, and a 400 would report an error for what is simply a no-op.
+    const passiveQuota = url.searchParams.get("quota") === "1" && quotaMode === "passive";
+    if (!wantQuota && !passiveQuota) return jsonResponse(projectAccounts());
     const forceRefresh = url.searchParams.get("refresh") === "1";
     // Probing may refresh the active credential and mark needsReauth — project health
     // from the post-probe store so the response is not stale.
-    const rows = await fetchProviderAccountQuotas(provider, forceRefresh);
+    const rows = passiveQuota
+      ? readPassiveProviderAccountQuotas(provider)
+      : await fetchProviderAccountQuotas(provider, forceRefresh, quotaProvider);
     const byId = new Map(rows.map(row => [row.accountId, row]));
     const projected = projectAccounts();
     return jsonResponse({
@@ -288,10 +311,13 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       accounts: projected.accounts.map(account => {
         const row = byId.get(account.id);
         if (!row) return account;
+        if (config.providers[provider] !== quotaProvider || row.isCurrent?.() === false) {
+          return { ...account, quota: null, quotaUnavailable: true };
+        }
         return {
           ...account,
           quota: row.quota,
-          ...(row.unavailable ? { quotaUnavailable: true } : {}),
+          ...(quotaMode === "probe" ? { quotaUnavailable: row.unavailable === true } : {}),
         };
       }),
     });
@@ -303,6 +329,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     if (!body.accountId) return jsonResponse({ error: "missing accountId" }, 400);
     const { setActiveAccount } = await import("../../oauth/store");
     if (!(await setActiveAccount(provider, body.accountId))) return jsonResponse({ error: "account not found" }, 404);
+    const { forgetGenericFailoverRoster } = await import("../../oauth/generic-account-failover");
+    forgetGenericFailoverRoster(provider);
     if (provider === "anthropic") {
       const { resetAnthropicRoutingForManualSelection } = await import("../../oauth/anthropic-routing");
       resetAnthropicRoutingForManualSelection(body.accountId);
@@ -319,7 +347,18 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   // Opt-in Anthropic OAuth account pool (#294): enable/threshold/strategy + clear cooldown.
   if (url.pathname === "/api/oauth/accounts/pool" && req.method === "GET") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
-    if (provider !== "anthropic") return jsonResponse({ error: "pool config is only supported for anthropic" }, 400);
+    if (provider !== "anthropic") {
+      // Generic OAuth pool-settings contract (#695 slice 1): persisted per provider. `strategy`
+      // and `autoSwitchThreshold` stay inert until the selector consumes them; `enabled` already
+      // governs the pre-dispatch account preference. Codex keeps /api/codex-auth; api-key
+      // providers have no pool.
+      const { poolSettingsCapability, genericPoolSettingsDto } = await import("../../oauth/pool-settings-capability");
+      const prov = config.providers[provider];
+      if (!provider || !prov || poolSettingsCapability(provider, prov) !== "generic") {
+        return jsonResponse({ error: "pool config is only supported for anthropic and generic OAuth providers" }, 400);
+      }
+      return jsonResponse(genericPoolSettingsDto(provider, prov));
+    }
     const pool = config.anthropicAccountPool ?? {};
     return jsonResponse({
       provider,
@@ -345,7 +384,43 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       quotaWindow?: unknown;
     };
     const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
-    if (provider !== "anthropic") return jsonResponse({ error: "pool config is only supported for anthropic" }, 400);
+    if (provider !== "anthropic") {
+      const {
+        poolSettingsCapability, genericPoolSettingsDto, parseGenericPoolStrategy, parseGenericAutoSwitchThreshold,
+      } = await import("../../oauth/pool-settings-capability");
+      const prov = config.providers[provider];
+      if (!provider || !prov || poolSettingsCapability(provider, prov) !== "generic") {
+        return jsonResponse({ error: "pool config is only supported for anthropic and generic OAuth providers" }, 400);
+      }
+      if (body.stickyLimit !== undefined || body.quotaWindow !== undefined) {
+        return jsonResponse({ error: "stickyLimit and quotaWindow are not part of the generic pool contract yet" }, 400);
+      }
+      const next = { ...(prov.oauthAccountFailover ?? {}) };
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== "boolean") return jsonResponse({ error: "enabled must be a boolean" }, 400);
+        next.enabled = body.enabled;
+      }
+      if (body.strategy !== undefined) {
+        if (body.strategy === null) delete next.strategy;
+        else {
+          const parsed = parseGenericPoolStrategy(body.strategy);
+          if (parsed === null) return jsonResponse({ error: "strategy must be one of: quota, round-robin, fill-first" }, 400);
+          next.strategy = parsed;
+        }
+      }
+      if (body.autoSwitchThreshold !== undefined) {
+        if (body.autoSwitchThreshold === null) delete next.autoSwitchThreshold;
+        else {
+          const parsed = parseGenericAutoSwitchThreshold(body.autoSwitchThreshold);
+          if (parsed === null) return jsonResponse({ error: "autoSwitchThreshold must be an integer 0-100" }, 400);
+          next.autoSwitchThreshold = parsed;
+        }
+      }
+      if (Object.keys(next).length > 0) prov.oauthAccountFailover = next;
+      else delete prov.oauthAccountFailover;
+      saveConfigPreservingClaudeCode(config);
+      return jsonResponse({ ok: true, ...genericPoolSettingsDto(provider, prov) });
+    }
     let enabled = config.anthropicAccountPool?.enabled === true;
     if (body.enabled !== undefined) {
       if (typeof body.enabled !== "boolean") return jsonResponse({ error: "enabled must be a boolean" }, 400);
@@ -512,7 +587,29 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const name = (url.searchParams.get("name") ?? "").trim();
     if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) return jsonResponse({ error: "unknown provider" }, 404);
     const { listProviderApiKeys } = await import("../../providers/api-keys");
-    return jsonResponse(listProviderApiKeys(config, name));
+    const projectKeys = () => {
+      const listed = listProviderApiKeys(config, name);
+      const provider = config.providers[name];
+      const quotaMode = provider ? providerApiKeyQuotaMode(name, provider) : "unsupported";
+      return { ...listed, keys: listed.keys.map(key => ({ ...key, quotaMode })) };
+    };
+    const initial = projectKeys();
+    if (url.searchParams.get("quota") !== "1" || !initial.keys.some(key => key.quotaMode === "probe")) {
+      return jsonResponse(initial);
+    }
+    const rows = await fetchProviderApiKeyQuotas(config, name, url.searchParams.get("refresh") === "1");
+    const byId = new Map(rows.map(row => [row.keyId, row]));
+    const current = projectKeys();
+    return jsonResponse({
+      activeId: current.activeId,
+      keys: current.keys.map(key => {
+        const row = byId.get(key.id);
+        if (!row || key.quotaMode !== "probe") return key;
+        if (!row.isCurrent()) return { ...key, quota: null, quotaUnavailable: true };
+        // Internal identity/epoch checks never enter the JSON DTO.
+        return { ...key, quota: row.quota, quotaUnavailable: row.unavailable === true };
+      }),
+    });
   }
   if (url.pathname === "/api/providers/keys" && req.method === "POST") {
     const body = await readManagementJsonBodyOr(req, {}) as { name?: string; key?: string; label?: string };
@@ -529,6 +626,35 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     const { clearKeyCooldowns } = await import("../../providers/key-failover");
     clearKeyCooldowns(name); // manual key management resets 429 cooldown state
     return jsonResponse({ ok: true, id: result.id }, 201);
+  }
+  // Opt-in OS keychain storage (#1221): move the active key and pool into the OS credential
+  // store (config keeps references), or restore plaintext. Store verifies the keychain before
+  // touching config so an unavailable store refuses instead of half-migrating.
+  if (url.pathname === "/api/providers/keychain" && req.method === "GET") {
+    const name = (url.searchParams.get("name") ?? "").trim();
+    if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) return jsonResponse({ error: "unknown provider" }, 404);
+    const { probeProviderKeychain, providerKeyStoreKind } = await import("../../providers/key-store");
+    const probe = probeProviderKeychain();
+    return jsonResponse({
+      name,
+      store: providerKeyStoreKind(config.providers[name]),
+      keychainAvailable: probe.available,
+      ...(probe.available ? {} : { keychainUnavailableReason: probe.reason }),
+    });
+  }
+  if (url.pathname === "/api/providers/keychain" && req.method === "POST") {
+    const body = await readManagementJsonBodyOr(req, {}) as { name?: unknown; action?: unknown };
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) return jsonResponse({ error: "unknown provider" }, 404);
+    if (body.action !== "store" && body.action !== "restore") return jsonResponse({ error: "action must be store or restore" }, 400);
+    const { storeProviderKeyInKeychain, restoreProviderKeyFromKeychain, providerKeyStoreKind } = await import("../../providers/key-store");
+    const result = body.action === "store"
+      ? storeProviderKeyInKeychain(config, name)
+      : restoreProviderKeyFromKeychain(config, name);
+    if (!result.ok) return jsonResponse({ error: result.error }, result.status);
+    const { clearProviderQuotaCache } = await import("../../providers/quota");
+    clearProviderQuotaCache();
+    return jsonResponse({ ...result, name, store: providerKeyStoreKind(config.providers[name]) });
   }
   if (url.pathname === "/api/providers/keys/active" && req.method === "PUT") {
     const body = await readManagementJsonBodyOr(req, {}) as { name?: string; id?: string };
@@ -579,6 +705,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   // API Keys management
   // ---------------------------------------------------------------------------
   if (url.pathname === "/api/keys" && req.method === "GET") {
+    if (removeExpiredApiKeyRotations(config)) {
+      saveConfigPreservingClaudeCode(config);
+      reconcileLiveStateStores();
+    }
     const keys = config.apiKeys ?? [];
     const endpoints = buildApiAccessEndpoints(config, {
       requestUrl: req.url,
@@ -596,6 +726,11 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
         name: k.name,
         prefix: k.key.slice(0, 17) + "...",
         createdAt: k.createdAt,
+        ...(k.pendingRotation ? { pendingRotation: {
+          id: k.pendingRotation.id,
+          createdAt: k.pendingRotation.createdAt,
+          expiresAt: k.pendingRotation.expiresAt,
+        } } : {}),
         usage: rollup.get(k.id) ?? { requests7d: 0, totalRequests: 0 },
       })),
       // Dataset-level and singular: it describes the usage log, not any one key.
@@ -604,6 +739,50 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       authMatrix: AUTH_MATRIX,
       ...endpoints,
     }, 200, req, config);
+  }
+
+  if (url.pathname === "/api/keys/rotate" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (!body || Object.keys(body).length !== 1 || typeof body.id !== "string" || !body.id) {
+      return jsonResponse({ error: "invalid body" }, 400, req, config);
+    }
+    const result = startApiKeyRotation(config, body.id);
+    if ("error" in result) {
+      return jsonResponse({ error: result.error === "not-found" ? "key not found" : "rotation already pending" }, result.error === "not-found" ? 404 : 409, req, config);
+    }
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
+    return jsonResponse(result, 201, req, config);
+  }
+
+  if (url.pathname === "/api/keys/rotate/commit" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (!body || Object.keys(body).length !== 2 || typeof body.id !== "string" || !body.id
+      || typeof body.rotationId !== "string" || !body.rotationId) {
+      return jsonResponse({ error: "invalid body" }, 400, req, config);
+    }
+    const result = commitApiKeyRotation(config, body.id, body.rotationId);
+    if ("error" in result) {
+      if (result.error === "expired") saveConfigPreservingClaudeCode(config);
+      return jsonResponse({ error: result.error === "not-found" ? "key rotation not found" : `rotation ${result.error}` }, result.error === "not-found" ? 404 : 409, req, config);
+    }
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
+    return jsonResponse({ ok: true }, 200, req, config);
+  }
+
+  if (url.pathname === "/api/keys/rotate" && req.method === "DELETE") {
+    const body = await readJsonBody(req);
+    if (!body || Object.keys(body).length !== 2 || typeof body.id !== "string" || !body.id
+      || typeof body.rotationId !== "string" || !body.rotationId) {
+      return jsonResponse({ error: "invalid body" }, 400, req, config);
+    }
+    if (!abortApiKeyRotation(config, body.id, body.rotationId)) {
+      return jsonResponse({ error: "key rotation not found or mismatched" }, 409, req, config);
+    }
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
+    return jsonResponse({ ok: true }, 200, req, config);
   }
 
   if (url.pathname === "/api/keys" && req.method === "POST") {
