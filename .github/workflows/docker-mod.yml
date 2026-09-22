@@ -60,7 +60,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=mod,enable={{is_default_branch}}
+            type=raw,value=mod
             type=sha,prefix=mod-,format=short
 
       - name: Build and push
