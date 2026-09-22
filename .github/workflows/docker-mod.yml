@@ -41,6 +41,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Generate compatibility manifest
+        run: bun scripts/generate-compatibility-version.ts
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
