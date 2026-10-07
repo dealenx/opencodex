@@ -3432,8 +3432,9 @@ describe("fetchProviderQuotaReports", () => {
       fiveHourPercent: 9.1,
       weeklyPercent: 59.2,
     });
-    expect(seen).toHaveLength(2);
-    expect(seen.map(s => s.url)).toEqual(["https://ollama.com/api/usage", "https://ollama.com/api/me"]);
+    // Order is usage → balance → me; the balance probe is the new quota-truth read.
+    expect(seen).toHaveLength(3);
+    expect(seen.map(s => s.url)).toEqual(["https://ollama.com/api/usage", "https://ollama.com/api/balance", "https://ollama.com/api/me"]);
     expect(seen[0]?.url).toBe("https://ollama.com/api/usage");
     expect(seen[0]?.authorization).toBe("Bearer ollama-cloud-secret");
     expect(seen[0]?.redirect).toBe("error");
@@ -3485,6 +3486,105 @@ describe("fetchProviderQuotaReports", () => {
       weeklyPercent: 20,
       monthlyPercent: 30,
     });
+  });
+
+  test("Ollama Cloud maps legacy balance shape (remaining_percent inverted to usage)", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.endsWith("/api/balance")) {
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer ollama-cloud-secret");
+        return new Response(JSON.stringify({
+          included: {
+            session: { remaining_percent: 55.74, resets_at: "2026-10-07T18:00:00Z" },
+            weekly: { remaining_percent: 36.27, resets_at: "2026-10-12T00:00:00Z" },
+          },
+          purchased: { balance_usd: 0 },
+        }), { status: 200 });
+      }
+      // /api/usage and /api/me fail-soft noise relative to the balance truth; a 200
+      // with an empty limits block keeps the usage probe short-circuit-free while
+      // contributing no windows itself.
+      return new Response(JSON.stringify({ activity: {}, limits: {} }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.source).toBe("ollama-cloud:usage");
+    expect(result.reports[0]?.quota).toMatchObject({
+      fiveHourPercent: 44.26,
+      weeklyPercent: 63.73,
+      fiveHourResetAt: Date.parse("2026-10-07T18:00:00Z"),
+      weeklyResetAt: Date.parse("2026-10-12T00:00:00Z"),
+    });
+    expect(seen.some(url => url.endsWith("/api/balance"))).toBe(true);
+  });
+
+  test("Ollama Cloud maps monthly-credit balance shape with Included usage window", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/balance")) {
+        return new Response(JSON.stringify({
+          included: {
+            balance_usd: 120.5,
+            allowance_usd: 300,
+            period: { from: "2026-10-01T06:43:25Z", until: "2026-11-01T06:43:25Z" },
+          },
+          purchased: { balance_usd: 25.75 },
+        }), { status: 200 });
+      }
+      // An empty limits block keeps the usage probe short-circuit-free while
+      // contributing no windows itself.
+      return new Response(JSON.stringify({ activity: {}, limits: {} }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.source).toBe("ollama-cloud:usage");
+    expect(result.reports[0]?.quota).toMatchObject({
+      monthlyPercent: 59.83,
+      monthlyResetAt: Date.parse("2026-11-01T06:43:25Z"),
+    });
+    const window = result.reports[0]?.quota.customWindows?.find(w => w.label.startsWith("Included usage"));
+    expect(window).toEqual({
+      label: "Included usage ($179.50 of $300.00 used, $25.75 purchased remaining)",
+      percent: 59.83,
+    });
+  });
+
+  test("Ollama Cloud falls back to plan-only report when balance 404s and /api/me works", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/balance")) return new Response("not found", { status: 404 });
+      if (url.endsWith("/api/me")) {
+        return new Response(JSON.stringify({ Plan: "max" }), { status: 200 });
+      }
+      // /api/usage must be a 200 with an empty limits block: any non-OK status would
+      // short-circuit the probe before the balance and plan requests are made.
+      return new Response(JSON.stringify({ activity: {}, limits: {} }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("ollama-cloud", "https://ollama.com/v1"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.quota).toMatchObject({
+      customWindows: [{ label: "Plan: max", percent: 0 }],
+    });
+    expect(result.reports[0]?.quota.fiveHourPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.weeklyPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
   });
 
   test("Ollama Cloud treats 404 as a no-report, not terminal", async () => {

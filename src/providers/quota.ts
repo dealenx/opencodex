@@ -736,6 +736,78 @@ export function parseOllamaCloudQuota(body: Record<string, unknown> | null): Pro
   return windows > 0 ? quota : null;
 }
 
+/**
+ * Ollama Cloud `GET https://ollama.com/api/balance` — the quota truth after the
+ * /api/usage `limits` block was retired. `/api/usage` now answers with a usage
+ * histogram and no limit data, so without this endpoint every window bar would
+ * vanish. Two plan shapes share the endpoint:
+ *
+ * - Legacy session/weekly plans report `included.{session,weekly}.remaining_percent`
+ *   as the REMAINING share, while ProviderQuota windows are consumed shares —
+ *   hence the 100-… inversion.
+ * - Migrated monthly-credit plans report `included.balance_usd` against
+ *   `allowance_usd`, plus `purchased.balance_usd` for top-up credit, which is
+ *   surfaced as text on the same "Included usage" label the old
+ *   `limits.monthly.used/limit` path produced.
+ */
+export function parseOllamaCloudBalanceQuota(body: Record<string, unknown> | null): ProviderQuota | null {
+  if (!body) return null;
+  const included = asRecord(body.included);
+  if (!included) return null;
+
+  const quota: ProviderQuota = { updatedAt: Date.now() };
+  let windows = 0;
+
+  const session = asRecord(included.session);
+  if (session) {
+    const remaining = toFiniteNumber(session.remaining_percent);
+    if (remaining !== undefined && remaining >= 0) {
+      quota.fiveHourPercent = normalizePercent(100 - remaining);
+      const resetAt = normalizeResetAt(session.resets_at);
+      if (resetAt !== undefined) quota.fiveHourResetAt = resetAt;
+      windows += 1;
+    }
+  }
+
+  const weekly = asRecord(included.weekly);
+  if (weekly) {
+    const remaining = toFiniteNumber(weekly.remaining_percent);
+    if (remaining !== undefined && remaining >= 0) {
+      quota.weeklyPercent = normalizePercent(100 - remaining);
+      const resetAt = normalizeResetAt(weekly.resets_at);
+      if (resetAt !== undefined) quota.weeklyResetAt = resetAt;
+      windows += 1;
+    }
+  }
+
+  const balanceUsd = toFiniteNumber(included.balance_usd);
+  const allowanceUsd = toFiniteNumber(included.allowance_usd);
+  if (balanceUsd !== undefined && allowanceUsd !== undefined && allowanceUsd > 0) {
+    // Same 2-decimal rounding the parseOllamaPercent legacy path used, so dashboard
+    // numbers stay comparable across plans.
+    const percentLeft = Math.round((1 - balanceUsd / allowanceUsd) * 10000) / 100;
+    const monthlyPercent = normalizePercent(percentLeft);
+    if (monthlyPercent === undefined) return null;
+    quota.monthlyPercent = monthlyPercent;
+    const period = asRecord(included.period);
+    const resetAt = period ? normalizeResetAt(period.until) : undefined;
+    if (resetAt !== undefined) quota.monthlyResetAt = resetAt;
+    windows += 1;
+    // Same labeled window the legacy limits.monthly.used/limit path produced, so
+    // migrated plans keep a human-readable dollar line on the dashboard.
+    const purchased = asRecord(body.purchased);
+    const purchasedUsd = purchased ? toFiniteNumber(purchased.balance_usd) : undefined;
+    const used = allowanceUsd - balanceUsd;
+    const suffix = purchasedUsd !== undefined && purchasedUsd > 0 ? `, $${purchasedUsd.toFixed(2)} purchased remaining` : "";
+    quota.customWindows = [...(quota.customWindows ?? []), {
+      label: `Included usage ($${used.toFixed(2)} of $${allowanceUsd.toFixed(2)} used${suffix})`,
+      percent: monthlyPercent,
+    }];
+  }
+
+  return windows > 0 ? quota : null;
+}
+
 async function fetchOllamaCloudQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
   const effectiveBaseUrl = config.baseUrl ?? getProviderRegistryEntry(provider)?.baseUrl ?? "";
   if (!isCanonicalOllamaCloudBaseUrl(effectiveBaseUrl)) return null;
@@ -757,6 +829,36 @@ async function fetchOllamaCloudQuota(provider: string, config: OcxProviderConfig
   // Plan level comes from POST /api/me (the dashboard's own identity probe; GET is
   // 405 by design). It is identity metadata, not a quota window: fail-soft, and a
   // failure keeps the usage bars while omitting the plan row.
+  const balance = await fetch(`${OLLAMA_CLOUD_BASE_URL}/api/balance`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }).catch(() => undefined);
+  // Same terminal semantics as the /api/usage probe: a 4xx other than timeout/429
+  // means the key is bad or the endpoint is gone, so drop the row instead of
+  // keeping a stale one.
+  if (balance) {
+    if (!balance.ok) {
+      // 404 on balance is fail-soft (the endpoint may lag rollout on some plan tiers);
+      // any other 4xx other than timeout/429 is terminal, same as the usage probe.
+      if (balance.status !== 404 && balance.status >= 400 && balance.status < 500
+        && balance.status !== 408 && balance.status !== 429) {
+        return TERMINAL_QUOTA_FAILURE;
+      }
+    } else {
+      const balanceBody = asRecord(await readQuotaJson(balance));
+      const balanceQuota = parseOllamaCloudBalanceQuota(balanceBody);
+      if (balanceQuota) {
+        quota.fiveHourPercent = balanceQuota.fiveHourPercent ?? quota.fiveHourPercent;
+        quota.fiveHourResetAt = balanceQuota.fiveHourResetAt ?? quota.fiveHourResetAt;
+        quota.weeklyPercent = balanceQuota.weeklyPercent ?? quota.weeklyPercent;
+        quota.weeklyResetAt = balanceQuota.weeklyResetAt ?? quota.weeklyResetAt;
+        quota.monthlyPercent = balanceQuota.monthlyPercent ?? quota.monthlyPercent;
+        quota.monthlyResetAt = balanceQuota.monthlyResetAt ?? quota.monthlyResetAt;
+        quota.customWindows = [...(quota.customWindows ?? []), ...(balanceQuota.customWindows ?? [])];
+      }
+    }
+  }
   const me = await fetch(`${OLLAMA_CLOUD_BASE_URL}/api/me`, {
     method: "POST",
     headers: {
