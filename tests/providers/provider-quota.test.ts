@@ -985,7 +985,7 @@ describe("fetchProviderQuotaReports", () => {
       if (url.endsWith("/api/me")) {
         return new Response(JSON.stringify({
           ID: "0000", CreatedAt: "2026-05-01T00:00:00Z",
-          Email: "user@example.com", Name: "user", Plan: "max",
+          Email: "user@example.com", Name: "user", Plan: "max", Bio: "2-е число",
         }), { status: 200 });
       }
       return new Response(JSON.stringify({
@@ -1011,7 +1011,7 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports[0]?.quota).toMatchObject({
       fiveHourPercent: 25,
       weeklyPercent: 75,
-      customWindows: [{ label: "Plan: max", percent: 0 }],
+      customWindows: [{ label: "Plan: max · Bio: 2-е число", percent: 0 }],
     });
   });
 

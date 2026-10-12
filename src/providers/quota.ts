@@ -872,11 +872,17 @@ async function fetchOllamaCloudQuota(provider: string, config: OcxProviderConfig
   }).catch(() => undefined);
   const meBody = me?.ok ? asRecord(await readQuotaJson(me)) : undefined;
   const plan = typeof meBody?.Plan === "string" && meBody.Plan.trim() ? meBody.Plan.trim().toLowerCase() : undefined;
-  if (plan) quota.customWindows = [...(quota.customWindows ?? []), {
-    label: `Plan: ${plan}`,
+  // `Bio` from the Ollama profile (/settings/profile) rides the same /api/me payload.
+  // Ollama exposes no billing-period end through the API, so operators park the
+  // paid-until date in Bio; surface it verbatim next to the plan. Fail-soft, and
+  // never let the label explode: the dashboard renders it as one row.
+  const bio = typeof meBody?.Bio === "string" ? meBody.Bio.trim() : "";
+  const planLabel = bio ? `Plan: ${plan ?? "unknown"} · Bio: ${bio}` : plan ? `Plan: ${plan}` : undefined;
+  if (planLabel) quota.customWindows = [...(quota.customWindows ?? []), {
+    label: planLabel,
     percent: 0,
   }];
-  return quota.fiveHourPercent !== undefined || quota.weeklyPercent !== undefined || quota.monthlyPercent !== undefined || plan || quota.customWindows?.length
+  return quota.fiveHourPercent !== undefined || quota.weeklyPercent !== undefined || quota.monthlyPercent !== undefined || plan !== undefined || quota.customWindows?.length !== undefined && quota.customWindows.length > 0
     ? report(provider, "ollama-cloud:usage", quota)
     : null;
 }
