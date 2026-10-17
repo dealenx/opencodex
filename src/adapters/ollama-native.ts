@@ -523,8 +523,17 @@ function usageFromNative(value: JsonRecord | undefined): OcxUsage | undefined {
   if (!value) return undefined;
   const input = isFiniteNonNegativeInteger(value.prompt_eval_count) ? value.prompt_eval_count : undefined;
   const output = isFiniteNonNegativeInteger(value.eval_count) ? value.eval_count : undefined;
-  if (input === undefined && output === undefined) return undefined;
-  return { inputTokens: input ?? 0, outputTokens: output ?? 0 };
+  // Ollama native reports KV-prefix cache hits as a separate counter; without it the
+  // client and cost overlay see full-price input even on a cache hit.
+  const cachedInput = isFiniteNonNegativeInteger(value.prompt_eval_cached_count)
+    ? value.prompt_eval_cached_count
+    : undefined;
+  if (input === undefined && output === undefined && cachedInput === undefined) return undefined;
+  return {
+    inputTokens: input ?? 0,
+    outputTokens: output ?? 0,
+    ...(cachedInput !== undefined ? { cachedInputTokens: cachedInput } : {}),
+  };
 }
 
 function stopReasonFromNative(value: unknown): string | undefined {
@@ -862,7 +871,7 @@ function processNativeLine(
     state.terminalError = true;
     return [nativeErrorEvent(parsed.error, state.usage)];
   }
-  if (parsed.prompt_eval_count !== undefined || parsed.eval_count !== undefined) {
+  if (parsed.prompt_eval_count !== undefined || parsed.eval_count !== undefined || parsed.prompt_eval_cached_count !== undefined) {
     state.usage = usageFromNative(parsed) ?? state.usage;
   }
   if (parsed.done_reason !== undefined) state.stopReason = stopReasonFromNative(parsed.done_reason);
