@@ -736,6 +736,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       upstreamWebsocket: p.upstreamWebsocket === true,
       authMode: p.authMode,
       apiKeyTransport: p.apiKeyTransport,
+      note: p.note,
       disabled: p.disabled === true,
       codexAccountMode: providerCodexAccountMode(name, p),
       ...(name === "xai" ? { xaiResponsesOptInState: xaiResponsesOptInState(p) } : {}),

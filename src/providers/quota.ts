@@ -809,7 +809,9 @@ export function parseOllamaCloudBalanceQuota(body: Record<string, unknown> | nul
 }
 
 async function fetchOllamaCloudQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
-  const effectiveBaseUrl = config.baseUrl ?? getProviderRegistryEntry(provider)?.baseUrl ?? "";
+  // A mirror/openai-chat baseUrl still carries an ollama.com key; the probe always
+  // hits canonical cloud endpoints regardless of where routing points.
+  const effectiveBaseUrl = OLLAMA_CLOUD_BASE_URL;
   if (!isCanonicalOllamaCloudBaseUrl(effectiveBaseUrl)) return null;
   const apiKey = resolveProviderApiKey(config.apiKey)?.trim();
   if (!apiKey) return null;
@@ -3044,6 +3046,9 @@ function keyQuotaReaderForProvider(name: string, provider: OcxProviderConfig): K
   if (name === "openrouter" && isCanonicalOpenRouterBaseUrl(provider.baseUrl)) return fetchOpenRouterQuota;
   if (name === "deepseek" && isCanonicalDeepSeekBaseUrl(provider.baseUrl)) return fetchDeepSeekQuota;
   if (name === "cline-pass" && isCanonicalClineBaseUrl(provider.baseUrl)) return fetchClineQuota;
+  // Ollama Cloud accounts can be re-pointed at a mirror/openai-chat baseUrl; the key is
+  // still an ollama.com key, probed at canonical cloud URLs regardless of the mirror.
+  if (typeof provider.note === "string" && /@\S+ — Ollama Cloud/i.test(provider.note)) return fetchOllamaCloudQuota;
   if (isCanonicalOllamaCloudBaseUrl(provider.baseUrl ?? getProviderRegistryEntry(name)?.baseUrl)) return fetchOllamaCloudQuota;
   if (["zai", "glm", "glm-cn", "zhipu-bigmodel-coding"].includes(name) && isCanonicalZaiBaseUrl(provider.baseUrl)) return fetchZaiQuota;
   if (["minimax", "minimax-cn"].includes(name) && isCanonicalMinimaxBaseUrl(provider.baseUrl)) return fetchMinimaxQuota;
