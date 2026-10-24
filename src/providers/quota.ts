@@ -3045,7 +3045,12 @@ function keyQuotaReaderForProvider(name: string, provider: OcxProviderConfig): K
   if (isCanonicalA6apiBaseUrl(provider.baseUrl)) return fetchA6apiQuota;
   if (name === "openrouter" && isCanonicalOpenRouterBaseUrl(provider.baseUrl)) return fetchOpenRouterQuota;
   if (name === "deepseek" && isCanonicalDeepSeekBaseUrl(provider.baseUrl)) return fetchDeepSeekQuota;
-  if (name === "cline-pass" && isCanonicalClineBaseUrl(provider.baseUrl)) return fetchClineQuota;
+  // Cline subscription rows are identified by the `cline-pass/` upstream slug, not by the
+  // row name: per-account rows (cline-pass-main, …) must keep the same meter as `cline-pass`.
+  if (
+    isCanonicalClineBaseUrl(provider.baseUrl)
+    && (name === "cline-pass" || (provider.models ?? []).some(id => id.startsWith("cline-pass/")))
+  ) return fetchClineQuota;
   // Ollama Cloud accounts can be re-pointed at a mirror/openai-chat baseUrl; the key is
   // still an ollama.com key, probed at canonical cloud URLs regardless of the mirror.
   if (typeof provider.note === "string" && /@\S+ — Ollama Cloud/i.test(provider.note)) return fetchOllamaCloudQuota;

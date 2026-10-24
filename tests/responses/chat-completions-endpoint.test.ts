@@ -1144,6 +1144,43 @@ test("chat-native non-stream upstream overflow returns 502 without hanging", asy
   }
 });
 
+test("chat-native non-stream unwraps a Cline-style data envelope", async () => {
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      return Response.json({
+        success: true,
+        data: {
+          id: "chatcmpl_wrapped",
+          object: "chat.completion",
+          choices: [{ index: 0, message: { role: "assistant", content: "wrapped ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 3, completion_tokens: 2 },
+        },
+      });
+    },
+  });
+  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`));
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(200);
+    const json = await response.json() as {
+      object: string;
+      choices: Array<{ message: { content: string }; finish_reason: string }>;
+    };
+    expect(json.object).toBe("chat.completion");
+    expect(json.choices[0]?.message.content).toBe("wrapped ok");
+    expect(json.choices[0]?.finish_reason).toBe("stop");
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+  }
+});
+
 test("chat-native non-stream invalid JSON returns a provider error", async () => {
   const upstream = Bun.serve({
     port: 0,

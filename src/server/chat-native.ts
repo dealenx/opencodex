@@ -169,8 +169,13 @@ function chatBodyCarriesImage(rawBody: Rec): boolean {
 }
 
 function chatCompletionJson(value: unknown): Rec | null {
-  if (!isRec(value) || !Array.isArray(value.choices) || value.choices.length === 0) return null;
-  return value;
+  if (!isRec(value)) return null;
+  // Cline (api.cline.bot) wraps the completion in `{"data": {...}, "success": true}`.
+  // Unwrap before the choices check, matching the adapter's unwrapChatCompletionPayload.
+  const inner = value.data;
+  const payload = isRec(inner) && !Array.isArray(value.choices) ? inner : value;
+  if (!Array.isArray(payload.choices) || payload.choices.length === 0) return null;
+  return payload;
 }
 
 interface HandleNativeChatOptions {

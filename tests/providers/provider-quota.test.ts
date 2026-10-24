@@ -951,6 +951,36 @@ describe("fetchProviderQuotaReports", () => {
     expect(seen[0]?.redirect).toBe("error");
   });
 
+  test("ClinePass quota also probes a renamed per-account row that carries the cline-pass slug", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response(JSON.stringify({
+        success: true,
+        data: { limits: [{ type: "weekly", percentUsed: 47 }] },
+      }), { status: 200 });
+    }) as typeof fetch;
+    const config: OcxConfig = {
+      defaultProvider: "cline-pass-main",
+      providers: {
+        "cline-pass-main": {
+          adapter: "openai-chat",
+          authMode: "key",
+          baseUrl: "https://api.cline.bot/api/v1",
+          apiKey: "sk-main",
+          models: ["cline-pass/glm-5.3-flash"],
+        },
+      },
+    } as OcxConfig;
+
+    const result = await fetchProviderQuotaReports(config, true);
+
+    expect(seen).toHaveLength(1);
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.source).toBe("cline:plan-usage-limits");
+    expect(result.reports[0]?.quota.weeklyPercent).toBe(47);
+  });
+
   test("ClinePass quota treats a 404 (no active plan) as a no-report, not terminal", async () => {
     globalThis.fetch = (async () => new Response("no plan", { status: 404 })) as typeof fetch;
     const config = keyQuotaConfig("cline-pass", "https://api.cline.bot/api/v1");
