@@ -49,11 +49,13 @@ ocx combo show main
 
 可選的別名給 combo 一個不同的公開模型名稱。別名：
 
-- 使用與 id 相同的字元；
+- 使用與 id 相同的字元，外加 `:` —— 因此可以佔用 `deepseek-v4.1-flash:cloud` 這類 Ollama 風格 id；
 - 可為裸名（例如 `daily-fast`），或含一個 `/`（例如 `team/daily-fast`）；
 - 不能是 `combo` 或以 `combo/` 開頭；
 - 不能與另一個 combo 別名重複；且
 - 不能是以 `gpt-`、`o1-`、`o3-`、`o4-` 或 `codex-` 開頭的裸原生 OpenAI 系列名稱。
+
+裸別名只佔用裸 id。別名本身含 `/` 時則佔用 `<provider>/<model>` 寫法，即客戶端限定供應商時送出的形式。
 
 即使設定了別名，規範的 `combo/<id>` 形式仍可解析。規範查詢在別名匹配之前執行，因此別名無法接管另一個 combo 的規範 id。
 

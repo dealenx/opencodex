@@ -2359,7 +2359,7 @@ export const tr: Record<TKey, string> = {
   "cws.err.missingId": "Kombo ID gereklidir.",
   "cws.err.invalidId": "ID harf veya sayı ile başlamalıdır.",
   "cws.err.duplicateId": "Bu ID ile bir kombo zaten var.",
-  "cws.err.invalidAlias": "Takma ad geçerli karakterler içermelidir.",
+  "cws.err.invalidAlias": "Takma ad harf, sayı, nokta, alt çizgi, iki nokta veya kısa çizgi içerebilir; en fazla bir \"/\" bölümü olabilir.",
   "cws.err.aliasReservedNamespace": "Takma ad ayrılmış namespace kullanamaz.",
   "cws.err.aliasNativeFamily": "Yerel OpenAI isimlerine izin verilmez.",
   "cws.err.unsupportedNativeAlias": "Yerel takma ad, şu anda desteklenen yalın bir OpenAI model kimliği olmalıdır.",

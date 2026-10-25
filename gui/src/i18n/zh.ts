@@ -2337,7 +2337,7 @@ export const zh: Record<TKey, string> = {
   "cws.err.missingId": "需要组合 ID。",
   "cws.err.invalidId": "ID 须以字母或数字开头，仅含字母、数字、点、下划线或连字符（最多 64）。",
   "cws.err.duplicateId": "已存在相同 ID 的组合。",
-  "cws.err.invalidAlias": "别名仅可包含字母、数字、点、下划线或连字符，最多一个“/”分段。",
+  "cws.err.invalidAlias": "别名仅可包含字母、数字、点、下划线、冒号或连字符，最多一个“/”分段。",
   "cws.err.aliasReservedNamespace": "别名不得使用保留的“combo/”命名空间。",
   "cws.err.aliasNativeFamily": "不允许使用 OpenAI 原生家族裸别名（gpt-*、o1-*、o3-*、o4-*、codex-*）。",
   "cws.err.unsupportedNativeAlias": "原生别名必须是当前受支持的 OpenAI 裸 model id。",

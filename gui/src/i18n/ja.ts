@@ -2357,7 +2357,7 @@ export const ja: Record<TKey, string> = {
   "cws.err.missingId": "コンボ ID は必須です。",
   "cws.err.invalidId": "ID は英字または数字で始まり、英数字、ドット、アンダースコア、ハイフンのみ使用できます(最大 64)。",
   "cws.err.duplicateId": "この ID のコンボはすでに存在します。",
-  "cws.err.invalidAlias": "エイリアスには英字、数字、ドット、アンダースコア、ハイフンを使用でき、スラッシュ区切りは 1 つまでです。",
+  "cws.err.invalidAlias": "エイリアスには英字、数字、ドット、アンダースコア、コロン、ハイフンを使用でき、スラッシュ区切りは 1 つまでです。",
   "cws.err.aliasReservedNamespace": "エイリアスに予約済みの \"combo/\" 名前空間は使用できません。",
   "cws.err.aliasNativeFamily": "OpenAI ネイティブファミリー（gpt-*、o1-*、o3-*、o4-*、codex-*）のプレフィックスなしエイリアスは使用できません。",
   "cws.err.unsupportedNativeAlias": "ネイティブエイリアスには、現在サポートされている OpenAI の bare model id を指定してください。",

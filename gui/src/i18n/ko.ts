@@ -2356,7 +2356,7 @@ export const ko: Record<TKey, string> = {
   "cws.err.missingId": "콤보 ID가 필요합니다.",
   "cws.err.invalidId": "ID는 문자/숫자로 시작하고 문자·숫자·점·밑줄·하이픈만 사용할 수 있습니다(최대 64).",
   "cws.err.duplicateId": "같은 ID의 콤보가 이미 있습니다.",
-  "cws.err.invalidAlias": "별칭은 문자·숫자·점·밑줄·하이픈만 사용할 수 있으며 \"/\" 구분은 최대 한 번만 허용됩니다.",
+  "cws.err.invalidAlias": "별칭은 문자·숫자·점·밑줄·콜론·하이픈만 사용할 수 있으며 \"/\" 구분은 최대 한 번만 허용됩니다.",
   "cws.err.aliasReservedNamespace": "별칭은 예약된 \"combo/\" 네임스페이스를 사용할 수 없습니다.",
   "cws.err.aliasNativeFamily": "OpenAI 네이티브 계열(gpt-*, o1-*, o3-*, o4-*, codex-*)의 접두사 없는 별칭은 허용되지 않습니다.",
   "cws.err.unsupportedNativeAlias": "네이티브 별칭은 현재 지원되는 OpenAI bare model id 중 하나여야 합니다.",

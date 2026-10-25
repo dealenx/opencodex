@@ -149,8 +149,8 @@ export interface ComboAttentionItem {
 }
 
 export const COMBO_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
-/** One optional "/" segment, each segment id-shaped — mirrors src/combos/types.ts. */
-export const COMBO_ALIAS_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}(\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,63})?$/;
+/** One optional "/" segment, each segment id-shaped — mirrors src/combos/types.ts (colon included for Ollama `:tag` ids). */
+export const COMBO_ALIAS_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}(\/[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63})?$/;
 const NATIVE_OPENAI_FAMILY_RE = /^(?:gpt-|o1-|o3-|o4-|codex-)/;
 
 export function isValidComboId(id: string): boolean {

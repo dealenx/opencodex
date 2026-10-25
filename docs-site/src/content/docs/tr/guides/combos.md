@@ -67,7 +67,8 @@ sağlayıcı adını yineleyemez.
 İsteğe bağlı bir takma ad, komboya farklı bir genel model adı verir. Bir takma
 ad:
 
-- bir kimlikle aynı karakterleri kullanır;
+- bir kimlikle aynı karakterleri ve ayrıca `:` kullanır — böylece `deepseek-v4.1-flash:cloud`
+  gibi Ollama tarzı bir kimlik de sahiplenilebilir;
 - `daily-fast` gibi yalın olabilir veya `team/daily-fast` gibi bir `/`
   içerebilir;
 - `combo` olamaz veya `combo/` ile başlayamaz;
@@ -373,6 +374,9 @@ saklanır:
 | `strategy` | Hayır | `"failover"` | İzin verilen değerler: `"failover"`, `"round-robin"`, `"random"`, `"least-used"`, `"reset-window"`. |
 | `stickyLimit` | Hayır | `1` | Yalnızca `round-robin` için geçerlidir; seçim başına 1 ile 100 arasında başarılı istek tam sayısı. |
 | `defaultEffort` | Hayır | `null` | `low`, `medium`, `high`, `xhigh`, `max` veya `ultra`; yalnızca arayan çabayı atladığında ve hedef desteği bildirdiğinde uygulanır. |
+Yalın bir takma ad yalnızca yalın kimliği sahiplenir. Kendisi `/` içeren bir takma ad,
+`<provider>/<model>` yazımını sahiplenir; bir sağlayıcıyı niteleyen istemci bu biçimi gönderir.
+
 | `alias` | Hayır | yok | İsteğe bağlı kırpılmış genel model kimliği; yukarıdaki takma ad kurallarını kullanın. Boş bir değer takma ad yok olarak saklanır. |
 | `nativeAlias` | Hayır | `false` | Şu anda desteklenen yalın bir yerel `alias`'ın yönlendirme ve katalog önceliği almasına açıkça izin verin. Asla takma addan çıkarılmaz. |
 | `displayName` | Hayır | yok | Sınırlı salt görüntüleme katalog etiketi. `nativeAlias` true olduğunda gerekli ve boş değildir. |

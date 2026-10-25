@@ -2333,7 +2333,7 @@ export const fr: Record<TKey, string> = {
   "cws.err.missingId": "L’identifiant de la combinaison est requis.",
   "cws.err.invalidId": "L’identifiant doit commencer par une lettre ou un chiffre et contenir uniquement des lettres, des chiffres, des points, des traits de soulignement ou des traits d’union (64 caractères au maximum).",
   "cws.err.duplicateId": "Une combinaison portant cet identifiant existe déjà.",
-  "cws.err.invalidAlias": "L’alias doit contenir des lettres, des chiffres, des points, des traits de soulignement ou des traits d’union, avec au plus un segment « / ».",
+  "cws.err.invalidAlias": "L’alias doit contenir des lettres, des chiffres, des points, des traits de soulignement, des deux-points ou des traits d’union, avec au plus un segment « / ».",
   "cws.err.aliasReservedNamespace": "L’alias ne doit pas utiliser l’espace de noms réservé « combo/ ».",
   "cws.err.aliasNativeFamily": "Les alias simples de la famille native OpenAI (gpt-*, o1-*, o3-*, o4-*, codex-*) ne sont pas autorisés.",
   "cws.err.unsupportedNativeAlias": "L’alias natif doit être un identifiant simple de modèle OpenAI actuellement pris en charge.",

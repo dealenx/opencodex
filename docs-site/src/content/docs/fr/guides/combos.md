@@ -59,12 +59,14 @@ l'occuper, et un identifiant combo ne peut pas dupliquer un nom de fournisseur c
 
 Un alias facultatif donne au combo un nom de modèle public différent. Un pseudonyme :
 
-- utilise les mêmes caractères qu'un identifiant ;
+- utilise les mêmes caractères qu'un identifiant, plus `:` — ainsi un identifiant au style Ollama comme `deepseek-v4.1-flash:cloud` peut être revendiqué ;
 - peut être nu, comme `daily-fast`, ou contenir un `/`, comme `team/daily-fast` ;
 - ne peut pas être `combo` ni commencer par `combo/` ;
 - ne peut pas dupliquer un autre alias de combo ; et
 - ne peut normalement pas être un simple nom de famille OpenAI natif commençant par `gpt-`, `o1-`, `o3-`, `o4-`,
   ou `codex-`. Le mode de compatibilité explicite du bureau ci-dessous est la seule exception.
+
+Un alias nu ne revendique que l'identifiant nu. Un alias qui contient lui-même `/` revendique la forme `<provider>/<model>`, celle qu'envoie un client qui a qualifié un fournisseur.
 
 Même lorsqu'un alias est défini, la forme canonique `combo/<id>` est toujours résolue. Exécutions de recherche canonique
 avant la correspondance d'alias, donc un alias ne peut pas reprendre l'identifiant canonique d'un autre combo.

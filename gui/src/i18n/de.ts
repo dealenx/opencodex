@@ -2317,7 +2317,7 @@ export const de: Record<TKey, string> = {
   "cws.err.missingId": "Combo-ID ist erforderlich.",
   "cws.err.invalidId": "ID muss mit Buchstabe/Zahl beginnen und darf nur Buchstaben, Zahlen, Punkte, Unterstriche oder Bindestriche enthalten (max. 64).",
   "cws.err.duplicateId": "Eine Combo mit dieser ID existiert bereits.",
-  "cws.err.invalidAlias": "Der Alias darf nur Buchstaben, Zahlen, Punkte, Unterstriche oder Bindestriche enthalten, mit höchstens einem \"/\"-Segment.",
+  "cws.err.invalidAlias": "Der Alias darf nur Buchstaben, Zahlen, Punkte, Unterstriche, Doppelpunkte oder Bindestriche enthalten, mit höchstens einem \"/\"-Segment.",
   "cws.err.aliasReservedNamespace": "Der Alias darf den reservierten Namensraum \"combo/\" nicht verwenden.",
   "cws.err.aliasNativeFamily": "Einfache Aliase aus der OpenAI-nativen Familie (gpt-*, o1-*, o3-*, o4-*, codex-*) sind nicht erlaubt.",
   "cws.err.unsupportedNativeAlias": "Ein nativer Alias muss eine derzeit unterstützte, unqualifizierte OpenAI-Modell-ID sein.",

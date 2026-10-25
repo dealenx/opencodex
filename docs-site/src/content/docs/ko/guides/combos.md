@@ -49,12 +49,14 @@ ocx combo show main
 
 선택적 alias를 쓰면 콤보의 공개 모델 이름을 따로 둘 수 있습니다. alias는 다음 조건을 따릅니다.
 
-- ID와 같은 문자를 사용합니다.
+- ID와 같은 문자에 `:`를 더해 사용합니다. 따라서 `deepseek-v4.1-flash:cloud` 같은 Ollama 형식 ID도 지정할 수 있습니다.
 - `daily-fast`처럼 단독일 수도 있고, `team/daily-fast`처럼 `/`를 하나 포함할 수도 있습니다.
 - `combo`일 수 없고 `combo/`로 시작할 수도 없습니다.
 - 다른 콤보 alias와 중복될 수 없습니다.
 - 일반적으로 `gpt-`, `o1-`, `o3-`, `o4-`, `codex-`로 시작하는 bare OpenAI 계열 이름일 수
   없습니다. 명시적 `nativeAlias: true` Desktop 호환 모드만 예외입니다.
+
+단독 alias는 단독 ID만 가로챕니다. alias 자체에 `/`가 있으면 `<provider>/<model>` 형식을 가로챕니다. 이는 클라이언트가 프로바이더를 한정해 보낼 때 쓰는 형식입니다.
 
 alias를 설정해도 정식 `combo/<id>` 형식은 계속 해석됩니다. 정식 조회가 alias 매칭보다 먼저 실행되므로, alias가 다른 콤보의 정식 ID를 가로챌 수는 없습니다.
 

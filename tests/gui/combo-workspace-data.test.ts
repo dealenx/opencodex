@@ -434,6 +434,8 @@ describe("combo-workspace-data", () => {
   test("validates public alias shape, namespace, family, and uniqueness", () => {
     expect(validate(combo({ alias: "deepseek-v4-flash" }))).toBeNull();
     expect(validate(combo({ alias: "vendor/deepseek-v4-flash" }))).toBeNull();
+    expect(validate(combo({ alias: "deepseek-v4.1-flash:cloud" }))).toBeNull();
+    expect(validate(combo({ alias: "ollama/deepseek-v4.1-flash:cloud" }))).toBeNull();
     expect(validate(combo({ alias: "  " }))).toBeNull();
     expect(validate(combo({ alias: "bad alias" }))).toBe("invalidAlias");
     expect(validate(combo({ alias: "a/b/c" }))).toBe("invalidAlias");

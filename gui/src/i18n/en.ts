@@ -2418,7 +2418,7 @@ export const en = {
   "cws.err.missingId": "Combo id is required.",
   "cws.err.invalidId": "Id must start with a letter or number and use only letters, numbers, dots, underscores, or hyphens (max 64).",
   "cws.err.duplicateId": "A combo with this id already exists.",
-  "cws.err.invalidAlias": "Alias must use letters, numbers, dots, underscores, or hyphens, with at most one \"/\" segment.",
+  "cws.err.invalidAlias": "Alias must use letters, numbers, dots, underscores, colons, or hyphens, with at most one \"/\" segment.",
   "cws.err.aliasReservedNamespace": "The alias must not use the reserved \"combo/\" namespace.",
   "cws.err.aliasNativeFamily": "Bare aliases in the OpenAI native family (gpt-*, o1-*, o3-*, o4-*, codex-*) are not allowed.",
   "cws.err.unsupportedNativeAlias": "Native alias must be a currently supported bare OpenAI model id.",

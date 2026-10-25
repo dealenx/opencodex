@@ -1210,6 +1210,66 @@ describe("deterministic combo selection", () => {
     });
   });
 
+  test("a colon-suffixed Ollama alias wins over the direct provider that shares its id", () => {
+    const config = baseConfig({
+      providers: {
+        a: { adapter: "openai-chat", baseUrl: "https://a.example/v1", apiKey: "ka", models: ["m1"] },
+        ollama: {
+          adapter: "openai-chat",
+          baseUrl: "https://ollama.example/v1",
+          apiKey: "ko",
+          models: ["deepseek-v4.1-flash:cloud"],
+        },
+      },
+      defaultProvider: "a",
+      combos: {
+        ds: {
+          alias: "deepseek-v4.1-flash:cloud",
+          targets: [{ provider: "a", model: "m1" }],
+        },
+      },
+    });
+
+    expect(routeModel(config, "deepseek-v4.1-flash:cloud")).toMatchObject({
+      providerName: "a",
+      modelId: "m1",
+      combo: { comboId: "ds" },
+    });
+    // A bare alias matches the bare id only. The `<provider>/<model>` spelling is claimed by
+    // an alias that itself carries the slash, which is a separate combo.
+    expect(routeModel(config, "ollama/deepseek-v4.1-flash:cloud")).toMatchObject({
+      providerName: "ollama",
+      modelId: "deepseek-v4.1-flash:cloud",
+    });
+  });
+
+  test("a qualified colon alias claims the provider-prefixed spelling", () => {
+    const config = baseConfig({
+      providers: {
+        a: { adapter: "openai-chat", baseUrl: "https://a.example/v1", apiKey: "ka", models: ["m1"] },
+        ollama: {
+          adapter: "openai-chat",
+          baseUrl: "https://ollama.example/v1",
+          apiKey: "ko",
+          models: ["deepseek-v4.1-flash:cloud"],
+        },
+      },
+      defaultProvider: "a",
+      combos: {
+        ds: {
+          alias: "ollama/deepseek-v4.1-flash:cloud",
+          targets: [{ provider: "a", model: "m1" }],
+        },
+      },
+    });
+
+    expect(routeModel(config, "ollama/deepseek-v4.1-flash:cloud")).toMatchObject({
+      providerName: "a",
+      modelId: "m1",
+      combo: { comboId: "ds" },
+    });
+  });
+
   test("an explicitly configured native alias resolves before canonical OpenAI routing", () => {
     const config = baseConfig({
       codexAccountNamespaces: { main: "@main" },
@@ -1278,6 +1338,10 @@ describe("combo validation and normalization", () => {
     };
     expect(comboAliasIssues("new", "plain-model", combos)).toEqual([]);
     expect(comboAliasIssues("new", "vendor/model", combos)).toEqual([]);
+    // Ollama-style `:tag` ids must be claimable, or a combo can never intercept them.
+    expect(comboAliasIssues("new", "deepseek-v4.1-flash:cloud", combos)).toEqual([]);
+    expect(comboAliasIssues("new", "ollama-agent/deepseek-v4.1-flash:cloud", combos)).toEqual([]);
+    expect(comboAliasIssues("new", "vendor/model:tag", combos)).toEqual([]);
     expect(comboAliasIssues("new", "combo/model", combos)[0]?.message).toContain("reserved");
     expect(comboAliasIssues("new", "gpt-5", combos)[0]?.message).toContain("OpenAI native family");
     expect(comboAliasIssues("new", "gpt-5.6-sol", combos, { allowNativeAlias: true })).toEqual([]);

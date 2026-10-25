@@ -59,12 +59,16 @@ occupy it, and a combo id cannot duplicate a configured provider name.
 
 An optional alias gives the combo a different public model name. An alias:
 
-- uses the same characters as an id;
+- uses the same characters as an id, plus `:` — so an Ollama-style id such as
+  `deepseek-v4.1-flash:cloud` can be claimed;
 - may be bare, such as `daily-fast`, or contain one `/`, such as `team/daily-fast`;
 - cannot be `combo` or start with `combo/`;
 - cannot duplicate another combo alias; and
 - cannot normally be a bare native OpenAI-family name beginning with `gpt-`, `o1-`, `o3-`, `o4-`,
   or `codex-`. The explicit Desktop compatibility mode below is the only exception.
+
+A bare alias claims only the bare id. An alias that itself contains `/` claims the
+`<provider>/<model>` spelling, which is what a client sends when it qualified a provider.
 
 Even when an alias is set, the canonical `combo/<id>` form still resolves. Canonical lookup runs
 before alias matching, so an alias cannot take over another combo's canonical id.

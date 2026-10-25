@@ -10,8 +10,13 @@ export { COMBO_NAMESPACE, preservesPhysicalComboProvider, isNativeAliasCombo, ta
  * Public alias shape: one optional "/" segment, each segment id-shaped. Bare aliases
  * (no "/") are the masquerade case — the combo answers to a mandated model id with no
  * `combo/` prefix. Codex-facing slugs tolerate at most one "/", so deeper paths reject.
+ *
+ * `:` is allowed because Ollama-style native ids carry a `:tag` suffix
+ * (`deepseek-v4.1-flash:cloud`). Operators point clients at those ids, and a combo can only
+ * intercept what it can spell. It is not an id character — `COMBO_ID_PATTERN` stays narrower,
+ * since the tag belongs to the model, not to the combo's own identity.
  */
-const COMBO_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/;
+const COMBO_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._:-]{0,63})?$/;
 /** Bare aliases in this family require the explicit `nativeAlias` opt-in below. */
 const NATIVE_OPENAI_FAMILY_PATTERN = /^(?:gpt-|o1-|o3-|o4-|codex-)/;
 
@@ -53,7 +58,7 @@ export function comboAliasIssues(
   if (!COMBO_ALIAS_PATTERN.test(alias)) {
     issues.push({
       path: ["alias"],
-      message: "alias must use letters, numbers, dot, underscore, or hyphen, with at most one \"/\" segment",
+      message: "alias must use letters, numbers, dot, underscore, colon, or hyphen, with at most one \"/\" segment",
     });
     return issues;
   }

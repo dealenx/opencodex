@@ -1813,7 +1813,7 @@ export const zhTW: Record<TKey, string> = {
   "cws.err.missingId": "需要組合 ID。",
   "cws.err.invalidId": "ID 須以字母或數字開頭，僅含字母、數字、點、下劃線或連字元（最多 64）。",
   "cws.err.duplicateId": "已存在相同 ID 的組合。",
-  "cws.err.invalidAlias": "別名僅可包含字母、數字、點、下劃線或連字元，最多一個“/”分段。",
+  "cws.err.invalidAlias": "別名僅可包含字母、數字、點、下劃線、冒號或連字元，最多一個“/”分段。",
   "cws.err.aliasReservedNamespace": "別名不得使用保留的“combo/”名稱空間。",
   "cws.err.aliasNativeFamily": "不允許使用 OpenAI 原生家族裸別名（gpt-*、o1-*、o3-*、o4-*、codex-*）。",
   "cws.err.duplicateAlias": "另一個組合已使用該別名。",
