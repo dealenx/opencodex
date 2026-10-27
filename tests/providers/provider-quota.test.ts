@@ -1266,6 +1266,29 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports).toEqual([]);
   });
 
+  test("per-account Z.AI rows (zai-omdfam style) are probed at the canonical base URL", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response(JSON.stringify({
+        success: true,
+        data: {
+          limits: [
+            { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 40.5, nextResetTime: 1789000000000 },
+          ],
+        },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    // No name match and no models list: the canonical destination alone selects the probe.
+    const result = await fetchProviderQuotaReports(keyQuotaConfig("zai-omdfam", "https://api.z.ai/api/coding/paas/v4"), true);
+
+    expect(result.reports[0]?.source).toBe("zai:quota-limit");
+    expect(seen[0]?.startsWith("https://api.z.ai/")).toBe(true);
+    // A foreign host with the same adapter stays fail-closed.
+    expect((await fetchProviderQuotaReports(keyQuotaConfig("zai-omdfam", "https://attacker.example/api/coding/paas/v4"), true)).reports).toEqual([]);
+  });
+
   test("Z.AI quota never sends the token to a non-canonical base URL", async () => {
     const seen: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {

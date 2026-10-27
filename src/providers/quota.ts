@@ -3055,7 +3055,9 @@ function keyQuotaReaderForProvider(name: string, provider: OcxProviderConfig): K
   // still an ollama.com key, probed at canonical cloud URLs regardless of the mirror.
   if (typeof provider.note === "string" && /@\S+ — Ollama Cloud/i.test(provider.note)) return fetchOllamaCloudQuota;
   if (isCanonicalOllamaCloudBaseUrl(provider.baseUrl ?? getProviderRegistryEntry(name)?.baseUrl)) return fetchOllamaCloudQuota;
-  if (["zai", "glm", "glm-cn", "zhipu-bigmodel-coding"].includes(name) && isCanonicalZaiBaseUrl(provider.baseUrl)) return fetchZaiQuota;
+  // Z.AI GLM Coding Plan rows are identified by the canonical z.ai/bigmodel destination,
+  // not by the row name: per-account rows (zai-omdfam, …) must keep the same meter as `zai`.
+  if (isCanonicalZaiBaseUrl(provider.baseUrl)) return fetchZaiQuota;
   if (["minimax", "minimax-cn"].includes(name) && isCanonicalMinimaxBaseUrl(provider.baseUrl)) return fetchMinimaxQuota;
   if (name === "moonshot" && isCanonicalMoonshotBaseUrl(provider.baseUrl)) return fetchMoonshotQuota;
   if (name === "venice" && isCanonicalVeniceBaseUrl(provider.baseUrl)) return fetchVeniceQuota;
