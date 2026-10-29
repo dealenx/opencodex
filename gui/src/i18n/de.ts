@@ -2005,6 +2005,7 @@ export const de: Record<TKey, string> = {
   "pws.costDisclaimer": "Schätzung basierend auf API-Listenpreisen, keine tatsächliche Abrechnung.",
   "pws.unresolvedRequestedModel": "Enthält Nutzung eines nicht aufgelösten angefragten Modells",
   "pws.currentAccountUsage": "Nutzung des aktuellen Kontos",
+  "pws.balanceLabel": "Guthaben",
   "pws.quotaUnsupported": "Für dieses Konto ist keine Kontingentabfrage verfügbar.",
   "pws.quotaUnobserved": "Noch keine Nutzungsdaten beobachtet.",
   "pws.quotaCheckCompleted": "Kontingentprüfung abgeschlossen",

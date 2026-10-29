@@ -1232,6 +1232,7 @@ export const ru: Record<TKey, string> = {
   "pws.costDisclaimer": "Оценка на основе публичных цен API, не фактический счёт.",
   "pws.unresolvedRequestedModel": "Включает запросы с неразрешённым именем модели",
   "pws.currentAccountUsage": "Использование текущего аккаунта",
+  "pws.balanceLabel": "Баланс",
   "pws.quotaUnsupported": "Запрос квоты для этого аккаунта не поддерживается.",
   "pws.quotaUnobserved": "Данных о наблюдаемом использовании пока нет.",
   "pws.quotaCheckCompleted": "Проверка квоты завершена",

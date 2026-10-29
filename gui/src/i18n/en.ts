@@ -1265,6 +1265,7 @@ export const en = {
   "pws.costDisclaimer": "API list-price estimate, not an actual charge.",
   "pws.unresolvedRequestedModel": "Includes unresolved requested model usage",
   "pws.currentAccountUsage": "Current account usage",
+  "pws.balanceLabel": "Balance",
   "pws.quotaUnsupported": "Quota lookup is not supported for this account.",
   "pws.quotaUnobserved": "No usage observation yet.",
   "pws.quotaCheckCompleted": "Quota check completed",

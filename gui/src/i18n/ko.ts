@@ -2044,6 +2044,7 @@ export const ko: Record<TKey, string> = {
   "pws.costDisclaimer": "API 공시가 기준 추정치이며, 실제 청구 금액이 아닙니다.",
   "pws.unresolvedRequestedModel": "기본 경로 요청 포함 · 실제 모델 미확인",
   "pws.currentAccountUsage": "현재 계정 사용량",
+  "pws.balanceLabel": "잔액",
   "pws.quotaUnsupported": "이 계정은 할당량 조회를 지원하지 않습니다.",
   "pws.quotaUnobserved": "아직 관측된 사용량이 없습니다.",
   "pws.quotaCheckCompleted": "할당량 확인 완료",

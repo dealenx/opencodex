@@ -1030,6 +1030,7 @@ export const zhTW: Record<TKey, string> = {
   "pws.costDisclaimer": "基於 API 公示價格的預估值，非實際計費金額。",
   "pws.unresolvedRequestedModel": "包含未解析請求模型、由預設供應商處理的用量",
   "pws.currentAccountUsage": "目前帳戶用量",
+  "pws.balanceLabel": "餘額",
   "pws.quotaUnsupported": "此帳戶不支援查詢配額。",
   "pws.quotaUnobserved": "尚未觀測到用量。",
   "pws.quotaCheckCompleted": "配額檢查完成",

@@ -2025,6 +2025,7 @@ export const zh: Record<TKey, string> = {
   "pws.costDisclaimer": "基于 API 公示价格的预估值，非实际计费金额。",
   "pws.unresolvedRequestedModel": "包含未解析请求模型、由默认提供商处理的用量",
   "pws.currentAccountUsage": "当前账户用量",
+  "pws.balanceLabel": "余额",
   "pws.quotaUnsupported": "此账户不支持查询配额。",
   "pws.quotaUnobserved": "尚未观测到用量。",
   "pws.quotaCheckCompleted": "配额检查完成",

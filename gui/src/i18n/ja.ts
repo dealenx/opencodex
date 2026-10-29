@@ -2433,6 +2433,7 @@ export const ja: Record<TKey, string> = {
   "pws.costDisclaimer": "API list-price estimate, not an actual charge.",
   "pws.unresolvedRequestedModel": "要求モデルを特定せず既定プロバイダーで処理した使用量を含む",
   "pws.currentAccountUsage": "現在のアカウントの使用量",
+  "pws.balanceLabel": "残高",
   "pws.quotaUnsupported": "このアカウントは割り当て量の照会に対応していません。",
   "pws.quotaUnobserved": "使用量はまだ観測されていません。",
   "pws.quotaCheckCompleted": "割り当て量の確認が完了しました",

@@ -13,6 +13,7 @@ import type { AccountQuotaReading, ProviderUsageTotals } from "./types";
 import { authModeLabel } from "./ProviderRail";
 import type { ProviderUpdatePatch, ProviderUpdateResult } from "./types";
 import ProviderCurrentQuota from "./ProviderCurrentQuota";
+import ProviderOpenRouterBalance from "./ProviderOpenRouterBalance";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import ProviderSponsor from "./ProviderSponsor";
 
@@ -279,6 +280,7 @@ export default function ProviderOverview({
         )}
       </section>
 
+      <ProviderOpenRouterBalance key={item.name} item={item} apiBase={apiBase} />
       <ProviderCurrentQuota key={`${item.name}:${connectionIdentity ?? ""}`} report={quotaReport} reading={currentQuotaReading} onRefreshQuota={onRefreshQuota} />
       </aside>
     </div>

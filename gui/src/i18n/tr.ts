@@ -1251,6 +1251,7 @@ export const tr: Record<TKey, string> = {
   "pws.costDisclaimer": "API liste fiyatı tahminidir.",
   "pws.unresolvedRequestedModel": "Çözümlenemeyen istenen model kullanımını içerir",
   "pws.currentAccountUsage": "Geçerli hesabın kullanımı",
+  "pws.balanceLabel": "Bakiye",
   "pws.quotaUnsupported": "Bu hesap için kota sorgulama desteklenmiyor.",
   "pws.quotaUnobserved": "Henüz kullanım gözlemi yok.",
   "pws.quotaCheckCompleted": "Kota kontrolü tamamlandı",

@@ -1237,6 +1237,7 @@ export const fr: Record<TKey, string> = {
   "pws.costDisclaimer": "Estimation fondée sur le tarif public de l’API, et non montant réellement facturé.",
   "pws.unresolvedRequestedModel": "Inclut l’utilisation d’un modèle demandé non résolu",
   "pws.currentAccountUsage": "Utilisation du compte actuel",
+  "pws.balanceLabel": "Solde",
   "pws.quotaUnsupported": "La consultation du quota n’est pas prise en charge pour ce compte.",
   "pws.quotaUnobserved": "Aucune utilisation observée pour le moment.",
   "pws.quotaCheckCompleted": "Vérification du quota terminée",
