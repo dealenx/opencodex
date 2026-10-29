@@ -82,6 +82,7 @@ import type { CatalogDisposition, ConvergeCodex } from "../codex/convergence-typ
 import { normalizeCatalogDisposition } from "../codex/catalog-refresh-status";
 import { managementBodyTooLargeResponse } from "./management/body";
 import { handleSessionRoutes } from "./management/session-routes";
+import { handleOpenRouterBalanceRoutes } from "./management/openrouter-balance-routes";
 
 // installed npm version instead of a stale hardcode.
 export const VERSION = (() => {
@@ -244,6 +245,7 @@ export async function handleManagementAPI(
     ??     (await handleRoutingAnalyticsRoutes(ctx))
     ??     (await handleRoutingProfileRoutesOnDemand(ctx))
     ??     (await handleProviderRoutes(ctx))
+    ??     (await handleOpenRouterBalanceRoutes(ctx))
     ??     (await handleModelRoutes(ctx))
     ??     (await handleIntegrationRoutes(ctx))
     ??     (await handleNativeIntegrationRoutes(ctx))
