@@ -21,6 +21,7 @@ import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
 import { LoginHint as LoginHintView } from "../login-url-block";
 import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import ProviderAccountQuota from "./ProviderAccountQuota";
+import ProviderOpenRouterBalance from "./ProviderOpenRouterBalance";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
 import { Switch } from "../../ui";
 import type {
@@ -624,6 +625,7 @@ export default function ProviderAuthPanel({
                 ))}
               </ul>
             )}
+            <ProviderOpenRouterBalance key={item.name} item={item} apiBase={apiBase} />
             {addingKey ? (
               <div className="pwi-auth-add-key">
                 <input className="input" type="password" value={newKey} onChange={e => setNewKey(e.target.value)}
