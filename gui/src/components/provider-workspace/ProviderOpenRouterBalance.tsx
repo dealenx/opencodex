@@ -25,9 +25,9 @@ export default function ProviderOpenRouterBalance({ item, apiBase }: {
   const [balance, setBalance] = useState<number | null>(null);
 
   useEffect(() => {
-    if (!apiBase) return;
     let alive = true;
-    fetch(`${apiBase}/api/providers/${encodeURIComponent(item.name)}/balance`)
+    // apiBase is "" on same-origin deployments — a relative URL is correct there.
+    fetch(`${apiBase ?? ""}/api/providers/${encodeURIComponent(item.name)}/balance`)
       .then(res => {
         if (!res.ok) throw new Error(String(res.status));
         return res.json() as Promise<OpenRouterBalanceDto>;
