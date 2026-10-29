@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 import { useT } from "../../i18n/shared";
 import type { WorkspaceItem } from "../../provider-workspace/catalog";
 
-interface OpenRouterBalanceDto {
+export interface OpenRouterBalanceDto {
   provider: string;
   totalCredits: number;
   totalUsage: number;
@@ -17,17 +17,14 @@ interface OpenRouterBalanceDto {
   checkedAt: string;
 }
 
-export default function ProviderOpenRouterBalance({ item, apiBase }: {
-  item: WorkspaceItem;
-  apiBase?: string;
-}) {
-  const t = useT();
+/** Remaining credit balance for a provider, or null while loading / unavailable. */
+// oxlint-disable-next-line react/only-export-components -- colocated with the row it feeds; callers import both from one place.
+export function useOpenRouterBalance(itemName: string, apiBase?: string): number | null {
   const [balance, setBalance] = useState<number | null>(null);
-
   useEffect(() => {
     let alive = true;
     // apiBase is "" on same-origin deployments — a relative URL is correct there.
-    fetch(`${apiBase ?? ""}/api/providers/${encodeURIComponent(item.name)}/balance`)
+    fetch(`${apiBase ?? ""}/api/providers/${encodeURIComponent(itemName)}/balance`)
       .then(res => {
         if (!res.ok) throw new Error(String(res.status));
         return res.json() as Promise<OpenRouterBalanceDto>;
@@ -37,11 +34,24 @@ export default function ProviderOpenRouterBalance({ item, apiBase }: {
       })
       .catch(() => { /* missing key or upstream error: keep the row hidden */ });
     return () => { alive = false; };
-  }, [apiBase, item.name]);
+  }, [apiBase, itemName]);
+  return balance;
+}
 
-  if (balance === null) return null;
+// oxlint-disable-next-line react/only-export-components -- shared by the dashboard row that renders the same scale.
+export function openRouterBalancePercent(balance: number): number {
   // $100 scale per product decision: $12 left → 12%; over-full saturates at 100%.
-  const percent = Math.max(0, Math.min(100, Math.round(balance)));
+  return Math.max(0, Math.min(100, Math.round(balance)));
+}
+
+export default function ProviderOpenRouterBalance({ item, apiBase }: {
+  item: WorkspaceItem;
+  apiBase?: string;
+}) {
+  const t = useT();
+  const balance = useOpenRouterBalance(item.name, apiBase);
+  if (balance === null) return null;
+  const percent = openRouterBalancePercent(balance);
   return (
     <section className="pws-section" aria-label={t("pws.currentAccountUsage")}>
       <h3 className="pws-section-title">{t("pws.currentAccountUsage")}</h3>

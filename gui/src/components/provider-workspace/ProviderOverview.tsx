@@ -13,7 +13,7 @@ import type { AccountQuotaReading, ProviderUsageTotals } from "./types";
 import { authModeLabel } from "./ProviderRail";
 import type { ProviderUpdatePatch, ProviderUpdateResult } from "./types";
 import ProviderCurrentQuota from "./ProviderCurrentQuota";
-import ProviderOpenRouterBalance from "./ProviderOpenRouterBalance";
+import ProviderOpenRouterBalance, { useOpenRouterBalance } from "./ProviderOpenRouterBalance";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import ProviderSponsor from "./ProviderSponsor";
 
@@ -59,6 +59,9 @@ export default function ProviderOverview({
 }) {
   const t = useT();
   const { locale } = useI18n();
+  // When the provider reports a credit balance, the rate-limit quota block below is
+  // "unsupported" noise for it — the balance row replaces it entirely.
+  const openRouterBalance = useOpenRouterBalance(item.name, apiBase);
   const status = binProviderStatus(item);
   const needsAttention = Boolean(item.activeNeedsReauth);
   const statusText = status === "ready"
@@ -281,7 +284,9 @@ export default function ProviderOverview({
       </section>
 
       <ProviderOpenRouterBalance key={item.name} item={item} apiBase={apiBase} />
-      <ProviderCurrentQuota key={`${item.name}:${connectionIdentity ?? ""}`} report={quotaReport} reading={currentQuotaReading} onRefreshQuota={onRefreshQuota} />
+      {openRouterBalance === null && (
+        <ProviderCurrentQuota key={`${item.name}:${connectionIdentity ?? ""}`} report={quotaReport} reading={currentQuotaReading} onRefreshQuota={onRefreshQuota} />
+      )}
       </aside>
     </div>
     </>

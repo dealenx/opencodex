@@ -594,6 +594,7 @@ export default function ProviderWorkspaceShell({
         ) : (
           <ProviderOverviewDashboard
             sections={sections}
+            apiBase={apiBase}
             quotaReports={quotaReports}
             usageTotals={usageTotals}
             usageLoading={usageLoading}

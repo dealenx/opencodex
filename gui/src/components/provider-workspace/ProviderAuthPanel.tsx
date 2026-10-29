@@ -21,7 +21,7 @@ import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
 import { LoginHint as LoginHintView } from "../login-url-block";
 import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import ProviderAccountQuota from "./ProviderAccountQuota";
-import ProviderOpenRouterBalance from "./ProviderOpenRouterBalance";
+import ProviderOpenRouterBalance, { useOpenRouterBalance } from "./ProviderOpenRouterBalance";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
 import { Switch } from "../../ui";
 import type {
@@ -226,6 +226,9 @@ export default function ProviderAuthPanel({
   const surface = providerAuthSurface({ ...item, hasApiKey: item.hasApiKey || keys.length > 0 });
   const isOauth = surface === "oauth-accounts";
   const isKeyAuth = surface === "api-keys";
+  // Credit-balance providers (OpenRouter) have no rate-limit quota probing: once the
+  // balance is available it replaces the per-key "unsupported" placeholder below.
+  const openRouterBalance = useOpenRouterBalance(item.name, apiBase);
 
   if (surface === "codex-accounts") {
     return (
@@ -618,8 +621,8 @@ export default function ProviderAuthPanel({
                     </button>
                     </div>
                     <div className="pwi-auth-acct-quota">
-                      <ProviderAccountQuota quotaMode={entry.quotaMode} quota={entry.quota}
-                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} />
+                      {openRouterBalance === null && <ProviderAccountQuota quotaMode={entry.quotaMode} quota={entry.quota}
+                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} />}
                     </div>
                   </li>
                 ))}

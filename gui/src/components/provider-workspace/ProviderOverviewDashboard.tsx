@@ -3,7 +3,7 @@
  * Shows summary cards, attention list, per-provider rate limits (QuotaBars stacked),
  * recently-used ranking, and Edit JSON entry.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useT, useI18n } from "../../i18n/shared";
 import { IconAlert, IconChevron, IconRefresh } from "../../icons";
 import type { WorkspaceSections, WorkspaceItem } from "../../provider-workspace/catalog";
@@ -26,9 +26,11 @@ import { ProviderIcon } from "./ProviderRail";
 import { formatProviderDisplayName } from "../../provider-icons";
 import QuotaBars from "../QuotaBars";
 import { ProviderCapacityQuota } from "./ProviderCapacityQuota";
+import { openRouterBalancePercent, type OpenRouterBalanceDto } from "./ProviderOpenRouterBalance";
 
 export default function ProviderOverviewDashboard({
   sections,
+  apiBase,
   quotaReports,
   usageTotals,
   usageLoading = false,
@@ -38,6 +40,7 @@ export default function ProviderOverviewDashboard({
   onRefreshAllQuotas,
 }: {
   sections: WorkspaceSections;
+  apiBase?: string;
   quotaReports: Record<string, ProviderQuotaReportView>;
   usageTotals: Record<string, ProviderUsageTotals>;
   usageLoading?: boolean;
@@ -112,6 +115,42 @@ export default function ProviderOverviewDashboard({
     }
     return result.sort((a, b) => b.urgency - a.urgency || a.item.name.localeCompare(b.item.name));
   }, [allItems, quotaReports]);
+
+  /*
+   * Credit-balance providers (OpenRouter) have no rate-limit report, so they never reach
+   * quotaProviders. Probe the balance endpoint per ready provider — providers without a
+   * management key answer 400 immediately, so this is one cheap round per mount.
+   */
+  const [balances, setBalances] = useState<Record<string, { balance: number; checkedAt: string }>>({});
+  const readyNamesKey = useMemo(() => sections.ready.map(p => p.name).join(","), [sections]);
+  useEffect(() => {
+    const names = readyNamesKey ? readyNamesKey.split(",") : [];
+    if (names.length === 0) return;
+    let alive = true;
+    void Promise.all(names.map(name =>
+      fetch(`${apiBase ?? ""}/api/providers/${encodeURIComponent(name)}/balance`)
+        .then((res): Promise<OpenRouterBalanceDto | null> => (res.ok ? res.json() : Promise.resolve(null)))
+        .then(data => (data && typeof data.balance === "number"
+          ? [name, { balance: data.balance, checkedAt: data.checkedAt }] as const
+          : null))
+        .catch(() => null)
+    )).then(results => {
+      if (!alive) return;
+      const next: Record<string, { balance: number; checkedAt: string }> = {};
+      for (const row of results) if (row) next[row[0]] = row[1];
+      setBalances(next);
+    });
+    return () => { alive = false; };
+  }, [apiBase, readyNamesKey]);
+
+  /* Balance rows: providers with a credit balance and no quota row of their own. */
+  const balanceRows = useMemo(() => {
+    const quotaNames = new Set(quotaProviders.map(row => row.item.name));
+    return allItems
+      .filter(item => !quotaNames.has(item.name) && balances[item.name] !== undefined)
+      .map(item => ({ item, reading: balances[item.name]! }))
+      .sort((a, b) => a.item.name.localeCompare(b.item.name));
+  }, [allItems, balances, quotaProviders]);
 
   /* Recently-used: filter to known provider names and cap at 4 (PR #139 parity) */
   const mostUsed = useMemo(() => {
@@ -204,7 +243,7 @@ export default function ProviderOverviewDashboard({
           aria-busy={quotasLoading || undefined}
         >
           <h3 className="pws-dashboard-section-title">{t("pws.dashboard.rateLimits")}</h3>
-          {quotaProviders.length > 0 ? (
+          {quotaProviders.length > 0 || balanceRows.length > 0 ? (
             <div className="pws-dashboard-rows">
               {quotaProviders.map(({ item, report }) => (
                 <button
@@ -226,6 +265,43 @@ export default function ProviderOverviewDashboard({
                   </div>
                 </button>
               ))}
+              {balanceRows.map(({ item, reading }) => {
+                const percent = openRouterBalancePercent(reading.balance);
+                // React's CSSProperties type here lacks the custom-property index; --bar-scale drives the bar fill.
+                const barStyle = { "--bar-scale": percent / 100 } as React.CSSProperties;
+                return (
+                  <button
+                    key={item.name}
+                    type="button"
+                    className="pws-dashboard-row"
+                    onClick={() => onSelectProvider(item.name)}
+                  >
+                    <ProviderIcon name={item.name} adapter={item.adapter} baseUrl={item.baseUrl} cls="pws-dashboard-row-icon" />
+                    <div className="pws-dashboard-row-info">
+                      <span className="pws-dashboard-row-name">{formatProviderDisplayName(item.name, t)}</span>
+                      <span className="pws-dashboard-row-meta muted">
+                        {t("pws.dashboard.checkedAgo", { time: formatRelativeTime(Date.parse(reading.checkedAt), timeLabels) })}
+                      </span>
+                    </div>
+                    <IconChevron className="pws-dashboard-row-chevron" aria-hidden="true" />
+                    <div className="pws-dashboard-row-bars">
+                      <div className="quota-stacked">
+                        <div className="quota-stacked-row">
+                          <div className="quota-stacked-head">
+                            <span className="quota-stacked-limit-group"><span className="quota-stacked-limit">{t("pws.balanceLabel")}</span></span>
+                          </div>
+                          <div className="quota-stacked-bar-row">
+                            <div className="bar quota-stacked-bar">
+                              <div className="bar-fill bar-green" style={barStyle} />
+                            </div>
+                            <span className="quota-stacked-used">{reading.balance.toFixed(2)} $ · {percent}%</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           ) : quotasLoading ? (
             <div className="pws-dashboard-rows pws-dashboard-rows--pending" aria-hidden="true">
