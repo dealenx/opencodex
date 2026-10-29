@@ -887,8 +887,9 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   location: "editor",
   mcpServers: "redacted",
   desktopExecutor: "redacted",
-  unsafeAllowNativeLocalExec: "editor",
   nativeLocalExec: "editor",
+  managementKey: "redacted",
+  unsafeAllowNativeLocalExec: "editor",
 } as const satisfies Record<keyof OcxProviderConfig, ProviderConfigFieldPolicy>;
 
 type ProviderFieldWithPolicy<Policy extends ProviderConfigFieldPolicy> = {

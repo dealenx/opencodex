@@ -387,6 +387,12 @@ export interface OcxProviderConfig {
    * `apiKey` seeds a one-entry pool on first management touch.
    */
   apiKeyPool?: Array<{ id: string; key: string; label?: string; addedAt?: number }>;
+  /**
+   * OpenRouter management key. Used to fetch the account's credit balance
+   * via `GET https://openrouter.ai/api/v1/credits`. Never persisted to the
+   * routed provider; read-only through the management API balance endpoint.
+   */
+  managementKey?: string;
   /** Changes on manual selection (including re-selection) and committed automatic allocation. */
   apiKeySelectionRevision?: string;
   /** Runtime only. Never expose in management responses or persist a routed provider. */
