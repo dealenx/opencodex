@@ -394,6 +394,13 @@ export interface OcxProviderConfig {
   defaultModel?: string;
   models?: string[];
   /**
+   * Model ids served without consuming this provider's plan quota (e.g. Ollama Cloud
+   * free-promo models). Quota-exhaustion routing veto (`cachedProviderQuotaIsExhausted`)
+   * is skipped for combo targets naming these ids, while quota windows are still
+   * probed and displayed for the provider's other models.
+   */
+  quotaExemptModels?: string[];
+  /**
    * Fetch the provider's live `/models` endpoint. Defaults to true.
    * Set false when `models` is an intentional allowlist or a provider's live catalog is too large
    * or too flaky for startup/catalog sync.

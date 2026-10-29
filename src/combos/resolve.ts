@@ -65,6 +65,9 @@ function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: 
   if (!Object.hasOwn(config.providers, target.provider)) return false;
   const provider = config.providers[target.provider];
   if (!provider || provider.disabled === true) return false;
+  // Free-promo models (e.g. Ollama Cloud beam) are served outside the plan quota, so a
+  // per-account exhaustion report must not veto them.
+  if (provider.quotaExemptModels?.includes(target.model)) return true;
   // Native account selection owns model-scoped quota; a provider summary cannot veto it.
   return isCanonicalOpenAiForwardProvider(provider)
     || !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now);

@@ -813,6 +813,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   models: "editor",
   liveModels: "editor",
   selectedModels: "editor",
+  quotaExemptModels: "editor",
   initialModelSelection: "runtime",
   retainModels: "editor",
   newModelPolicy: "editor",
