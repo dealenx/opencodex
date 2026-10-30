@@ -393,6 +393,13 @@ export interface OcxProviderConfig {
    * routed provider; read-only through the management API balance endpoint.
    */
   managementKey?: string;
+  /**
+   * Xiaomi MiMo platform console session cookie. The platform quota API
+   * (`GET /api/v1/tokenPlan/usage`) accepts only this session and rejects the
+   * tp- API key with 401; read-only by the quota probe. Redacted in management
+   * responses.
+   */
+  sessionCookie?: string;
   /** Changes on manual selection (including re-selection) and committed automatic allocation. */
   apiKeySelectionRevision?: string;
   /** Runtime only. Never expose in management responses or persist a routed provider. */

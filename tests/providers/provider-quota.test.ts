@@ -1006,6 +1006,96 @@ describe("fetchProviderQuotaReports", () => {
     expect(seen).toEqual([]);
   });
 
+  const mimoTokenPlanConfig = (): OcxConfig => ({
+    defaultProvider: "mimo-token-plan",
+    providers: {
+      "mimo-token-plan": {
+        adapter: "openai-chat",
+        authMode: "key",
+        baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
+        apiKey: "tp-secret",
+        sessionCookie: "api-platform_serviceToken=abc; userId=1",
+      },
+    },
+  } as OcxConfig);
+
+  test("MiMo Token Plan quota reports utilization and remaining share from the platform usage API", async () => {
+    const seen: Array<{ url: string; cookie?: string; redirect?: RequestRedirect }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      seen.push({ url: String(input), cookie: headers?.Cookie, redirect: init?.redirect });
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          usage: { percent: 0.02, items: [
+            { name: "plan_total_token", used: 244142656, limit: 11000000000, percent: 0.02 },
+          ] },
+        },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(mimoTokenPlanConfig(), true);
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.source).toBe("mimo:tokenPlan/usage");
+    const window = result.reports[0]?.quota.customWindows?.[0];
+    expect(window?.percent).toBe(2.22);
+    expect(window?.label).toBe("Token Plan · 97.8% left");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe("https://platform.xiaomimimo.com/api/v1/tokenPlan/usage");
+    expect(seen[0]?.cookie).toBe("api-platform_serviceToken=abc; userId=1");
+    expect(seen[0]?.redirect).toBe("error");
+  });
+
+  test("MiMo Token Plan quota probes without a session cookie only when none is configured", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+    const config = mimoTokenPlanConfig();
+    delete config.providers["mimo-token-plan"].sessionCookie;
+
+    const result = await fetchProviderQuotaReports(config, true);
+
+    expect(result.reports).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  test("MiMo Token Plan quota never sends the cookie to a non-canonical base URL", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+    const config = mimoTokenPlanConfig();
+    config.providers["mimo-token-plan"].baseUrl = "https://attacker.example/v1";
+
+    const result = await fetchProviderQuotaReports(config, true);
+
+    expect(result.reports).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  test("MiMo Token Plan quota treats an expired session (401) as terminal (drops last-good)", async () => {
+    let rejected = false;
+    globalThis.fetch = (async () => {
+      if (rejected) return new Response("unauthorized", { status: 401 });
+      return new Response(JSON.stringify({
+        code: 0,
+        data: { usage: { items: [{ name: "plan_total_token", used: 1, limit: 100, percent: 0.01 }] } },
+      }), { status: 200 });
+    }) as typeof fetch;
+    const config = mimoTokenPlanConfig();
+
+    const valid = await fetchProviderQuotaReports(config, true);
+    rejected = true;
+    const invalid = await fetchProviderQuotaReports(config, true);
+
+    expect(valid.reports).toHaveLength(1);
+    expect(invalid.reports).toEqual([]);
+  });
+
   test("Ollama Cloud quota maps session/weekly/monthly windows from /api/usage", async () => {
     const seen: Array<{ url: string; authorization?: string; redirect?: RequestRedirect }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

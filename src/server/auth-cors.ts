@@ -889,6 +889,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   desktopExecutor: "redacted",
   nativeLocalExec: "editor",
   managementKey: "redacted",
+  sessionCookie: "redacted",
   unsafeAllowNativeLocalExec: "editor",
 } as const satisfies Record<keyof OcxProviderConfig, ProviderConfigFieldPolicy>;
 

@@ -97,6 +97,7 @@ const VENICE_BASE_URL = "https://api.venice.ai/api/v1";
 const SYNTHETIC_BASE_URL = "https://api.synthetic.new/v2";
 const DEEPINFRA_BASE_URL = "https://api.deepinfra.com";
 const NEURALWATT_BASE_URL = "https://api.neuralwatt.com/v1";
+const MIMO_TOKEN_PLAN_USAGE_URL = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
 const XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const XAI_CREDITS_URL = `${XAI_BILLING_URL}?format=credits`;
 /** Keep a failed probe's previous row at most this long before dropping it. */
@@ -334,6 +335,12 @@ function isCanonicalDeepSeekBaseUrl(baseUrl: string): boolean {
 function isCanonicalClineBaseUrl(baseUrl: string): boolean {
   const normalized = normalizedBaseUrl(baseUrl);
   return normalized === CLINE_BASE_URL || normalized === `${CLINE_BASE_URL}/api/v1`;
+}
+
+/** Token-plan rows live on the sgp/cn/ams cluster hosts; plan usage lives on the platform host. */
+function isCanonicalMimoTokenPlanBaseUrl(baseUrl: string): boolean {
+  const normalized = normalizedBaseUrl(baseUrl);
+  return normalized !== null && /^https:\/\/token-plan-[a-z0-9-]+\.xiaomimimo\.com\/v1$/.test(normalized);
 }
 
 function isCanonicalOllamaCloudBaseUrl(baseUrl?: string): boolean {
@@ -674,6 +681,49 @@ async function fetchClineQuota(provider: string, config: OcxProviderConfig): Pro
     }
   }
   return windows > 0 ? report(provider, "cline:plan-usage-limits", quota) : null;
+}
+
+/**
+ * Xiaomi MiMo Token Plan `GET /api/v1/tokenPlan/usage` on the platform host.
+ * The tp- API key is rejected there (401); the console session cookie stored as
+ * `sessionCookie` is the only accepted credential, and an expired session is a
+ * terminal failure the operator resolves by refreshing the cookie. Utilization
+ * rides the window percent (every quota bar renders "% used"); the remaining
+ * share rides the label, the number the plan view exists to show.
+ */
+async function fetchMimoTokenPlanQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+  if (!isCanonicalMimoTokenPlanBaseUrl(config.baseUrl)) return null;
+  const sessionCookie = config.sessionCookie?.trim();
+  if (!sessionCookie) return null;
+  const response = await fetch(MIMO_TOKEN_PLAN_USAGE_URL, {
+    headers: { Accept: "application/json", Cookie: sessionCookie },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+      ? TERMINAL_QUOTA_FAILURE
+      : null;
+  }
+  const body = asRecord(await readQuotaJson(response));
+  const data = asRecord(body?.data) ?? body;
+  const usage = asRecord(data?.usage);
+  const items = Array.isArray(usage?.items) ? usage.items : null;
+  const plan = items
+    ? items.map(raw => asRecord(raw)).find(row => row?.name === "plan_total_token") ?? null
+    : null;
+  const used = toFiniteNumber(plan?.used);
+  const limit = toFiniteNumber(plan?.limit);
+  if (used === undefined || limit === undefined || used < 0 || limit <= 0) return null;
+  const usedPercent = Math.min(100, (used / limit) * 100);
+  const remainingPercent = Math.max(0, 100 - usedPercent);
+  return report(provider, "mimo:tokenPlan/usage", {
+    customWindows: [{
+      label: `Token Plan · ${remainingPercent.toFixed(1)}% left`,
+      percent: Math.round(usedPercent * 100) / 100,
+    }],
+    updatedAt: Date.now(),
+  });
 }
 
 /**
@@ -3051,6 +3101,9 @@ function keyQuotaReaderForProvider(name: string, provider: OcxProviderConfig): K
     isCanonicalClineBaseUrl(provider.baseUrl)
     && (name === "cline-pass" || (provider.models ?? []).some(id => id.startsWith("cline-pass/")))
   ) return fetchClineQuota;
+  // Xiaomi MiMo Token Plan rows probe platform plan usage with the console session
+  // cookie; the platform rejects the tp- model key (401).
+  if (isCanonicalMimoTokenPlanBaseUrl(provider.baseUrl)) return fetchMimoTokenPlanQuota;
   // Ollama Cloud accounts can be re-pointed at a mirror/openai-chat baseUrl; the key is
   // still an ollama.com key, probed at canonical cloud URLs regardless of the mirror.
   if (typeof provider.note === "string" && /@\S+ — Ollama Cloud/i.test(provider.note)) return fetchOllamaCloudQuota;
